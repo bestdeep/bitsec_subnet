@@ -27,6 +27,8 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: Run pytest
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: pytest ./tests
 
       - name: Deploy via SSH
