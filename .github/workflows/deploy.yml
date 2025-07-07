@@ -36,6 +36,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
+            source ~/.profile
             cd bitsec-subnet
             git pull origin v/docker-test
             docker compose -f docker-compose.test.yml build
