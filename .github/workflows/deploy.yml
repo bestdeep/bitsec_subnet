@@ -21,13 +21,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: Run pytest
-        run: pytest ./tests  # Adjust test directory as needed
+        run: pytest ./tests
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v0.1.6
