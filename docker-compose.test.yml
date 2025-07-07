@@ -2,7 +2,7 @@ services:
   miner:
     build: .
     container_name: miner
-    command: /bin/sh -c "./start-miner.sh --test"
+    command: ./start-miner.sh --test
     network_mode: "host"
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
@@ -15,7 +15,7 @@ services:
   validator:
     build: .
     container_name: validator
-    command: /bin/sh -c "./start-validator.sh --test"
+    command: ./start-validator.sh --test --proxy.port 10914
     network_mode: "host"
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
