@@ -12,6 +12,10 @@ services:
       - ./:/app
       - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets/
     working_dir: /app
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
 
   validator:
     build: .
@@ -26,3 +30,7 @@ services:
       - ./:/app
       - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets/
     working_dir: /app
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
