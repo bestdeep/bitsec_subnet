@@ -95,11 +95,6 @@ async def forward(self):
     response_time = time.time() - start_time
     #wandb.log({"response_time": response_time})
 
-    # Keep valid responses only
-    filter_mask = [r is not None for r in responses]
-    miner_uids = miner_uids[filter_mask]
-    responses = [r for r in responses if r is not None]
-
     # Log the results for monitoring purposes.
     bt.logging.info(f"Received {len(responses)} responses")
 
