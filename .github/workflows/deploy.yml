@@ -40,7 +40,7 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
             source ~/.profile
-            cd bitsec-subnet
+            cd ${{ github.event.repository.name }}
             git pull origin v/docker-test
             docker compose -f docker-compose.test.yml build
             docker compose -f docker-compose.test.yml up -d --force-recreate
