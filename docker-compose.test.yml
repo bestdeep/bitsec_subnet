@@ -14,8 +14,7 @@ services:
     working_dir: /app
     deploy:
       restart_policy:
-        condition: on-failure
-        max_attempts: 3
+        condition: unless-stopped
 
   validator:
     build: .
@@ -32,5 +31,4 @@ services:
     working_dir: /app
     deploy:
       restart_policy:
-        condition: on-failure
-        max_attempts: 3
+        condition: unless-stopped
