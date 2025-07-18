@@ -101,5 +101,4 @@ if __name__ == "__main__":
     with Validator() as validator:
         while True:
             validator.check_for_thread_exception()
-            bt.logging.info(f"uid {validator.uid} tick")
             time.sleep(60)
