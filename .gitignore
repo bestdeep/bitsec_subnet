@@ -176,10 +176,11 @@ testing/
 # Editors
 .vscode/settings.json
 
-
 # wandb logs
 wandb/*
 
 # Logs comparing models
 model_comparisons/*
 
+# dotenv files
+.env.*
