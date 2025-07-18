@@ -7,12 +7,16 @@ NETWORK="finney"
 PORT=9090  # Default port
 PROXY_PORT=10913 # Used on DigitalOcean
 COMMAND_WITH_PATH="python3"
+WALLET_PREFIX=""
 
-if [ "$1" == "--test" -o "$1" == "--testnet" ] || [ "$1" == "--testnet" ]; then
+for arg in "$@"; do
+  if [ "$arg" = "--test" ] || [ "$arg" = "--testnet" ]; then
     ENV="testnet"
     NETUID=350
     NETWORK="test"
-fi
+    WALLET_PREFIX="testnet_"
+  fi
+done
 
 #if proxy.port in args anywhere, use it
 if [[ "$@" == *"--proxy.port"* ]]; then
@@ -29,6 +33,6 @@ fi
 echo "Starting miner in $ENV environment with netuid $NETUID on port $PORT"
 $COMMAND_WITH_PATH -m neurons.miner --netuid $NETUID \
     --subtensor.chain_endpoint $NETWORK --subtensor.network $NETWORK \
-    --wallet.name miner --wallet.hotkey default \
+    --wallet.name "${WALLET_PREFIX}miner" --wallet.hotkey default \
     --axon.port $PORT --axon.external_port $PORT \
     --logging.debug --proxy.port $PROXY_PORT
