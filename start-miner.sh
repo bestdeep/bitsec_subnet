@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default to production environment
-ENV="mainnet"
+ENV="prod"
 NETUID=60
 NETWORK="finney"
 PORT=9090  # Default port
@@ -11,7 +11,7 @@ WALLET_PREFIX=""
 
 for arg in "$@"; do
   if [ "$arg" = "--test" ] || [ "$arg" = "--testnet" ]; then
-    ENV="testnet"
+    ENV="test"
     NETUID=350
     NETWORK="test"
     WALLET_PREFIX="testnet_"
