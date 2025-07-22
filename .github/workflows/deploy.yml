@@ -30,7 +30,6 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: pytest ./tests
-        continue-on-error: true
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v0.1.6

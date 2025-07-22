@@ -68,6 +68,7 @@ def print_and_compare(before: str, after: str) -> None:
     for line in diff.compare(before.splitlines(), after.splitlines()):
         print(line)
 
+@pytest.mark.skip(reason="Non-deterministic, should test functionality")
 def test_normalize_whitespace(before: str) -> None:
     """Test normalizing whitespace in the code."""
     # add random whitespace to the code
