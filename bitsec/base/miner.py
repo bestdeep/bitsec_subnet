@@ -120,6 +120,8 @@ class BaseMinerNeuron(BaseNeuron):
         # This loop maintains the miner's operations until intentionally stopped.
         try:
             while not self.should_exit:
+                bt.logging.info(f"uid {self.uid} tick - step({self.step}) - block({self.block})")
+
                 while (
                     self.block - self.metagraph.last_update[self.uid]
                     < self.config.neuron.epoch_length

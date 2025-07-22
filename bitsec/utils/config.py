@@ -20,7 +20,7 @@ import os
 import subprocess
 import argparse
 import bittensor as bt
-from .logging import setup_events_logger
+from .logger import setup_events_logger
 
 def is_cuda_available():
     try:

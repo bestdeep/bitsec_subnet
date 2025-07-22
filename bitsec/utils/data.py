@@ -8,7 +8,7 @@ import bittensor as bt
 from typing import List, Tuple, TypeVar, Union
 from bitsec.protocol import PredictionResponse
 from bitsec.utils.llm import chat_completion, get_total_spend_cents, get_total_spend_cents_description, reset_total_spend_description
-from bitsec.utils.logging import shorten_to_filename
+from bitsec.utils.logger import shorten_to_filename
 
 SAMPLE_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'samples')
 VULNERABILITIES_DIR = 'vulnerabilities'

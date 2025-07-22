@@ -3,11 +3,17 @@
 This section is for first-time setup and installations.
 
 ```
-btcli wallet new_coldkey --wallet.name owner --no-use-password --quiet
+btcli wallet new_coldkey --wallet.name testnet_miner --no-use-password --quiet
+btcli wallet new_hotkey --wallet.name testnet_miner --wallet.hotkey default --quiet
+btcli wallet new_coldkey --wallet.name testnet_validator --no-use-password --quiet
+btcli wallet new_hotkey --wallet.name testnet_validator --wallet.hotkey default --quiet
+
 btcli wallet new_coldkey --wallet.name miner --no-use-password --quiet
 btcli wallet new_hotkey --wallet.name miner --wallet.hotkey default --quiet
 btcli wallet new_coldkey --wallet.name validator --no-use-password --quiet
 btcli wallet new_hotkey --wallet.name validator --wallet.hotkey default --quiet
+
+btcli wallet new_coldkey --wallet.name owner --no-use-password --quiet
 touch .wallets_setup
 btcli wallet list
 ```
@@ -24,8 +30,8 @@ Once all wallets have tokens, register the miner and validator to the subnet.
 ## For TESTNET:
 
 ```
-btcli subnet register --wallet.name miner --netuid 350 --wallet.hotkey default --subtensor.chain_endpoint test
-btcli subnet register --wallet.name validator --netuid 350 --wallet.hotkey default --subtensor.chain_endpoint test
+btcli subnet register --wallet.name testnet_miner --netuid 350 --wallet.hotkey default --subtensor.chain_endpoint test
+btcli subnet register --wallet.name testnet_validator --netuid 350 --wallet.hotkey default --subtensor.chain_endpoint test
 ```
 
 ## For MAINNET:

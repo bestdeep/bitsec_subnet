@@ -148,7 +148,7 @@ class BaseValidatorNeuron(BaseNeuron):
         # This loop maintains the validator's operations until intentionally stopped.
         try:
             while True:
-                bt.logging.info(f"step({self.step}) block({self.block})")
+                bt.logging.info(f"uid {self.uid} tick - step({self.step}) - block({self.block})")
 
                 # Run validator proxy if port is specified
                 if self.config.proxy.port:

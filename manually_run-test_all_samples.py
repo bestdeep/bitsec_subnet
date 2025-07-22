@@ -10,7 +10,7 @@ from bitsec.miner.prompt import analyze_code
 from bitsec.protocol import PredictionResponse, Vulnerability, LineRange
 from bitsec.utils.data import create_challenge, get_all_vulnerability_and_secure_filenames
 from bitsec.validator.reward import score_response
-from bitsec.utils.logging import shorten_to_filename
+from bitsec.utils.logger import shorten_to_filename
 
 
 def test_response_for_every_sample_no_vulnerabilities():

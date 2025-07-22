@@ -27,6 +27,8 @@ __spec_version__ = (
     + (1 * int(version_split[2]))
 )
 
+import bitsec.utils.env
+
 # Import all submodules.
 from . import protocol
 from . import base

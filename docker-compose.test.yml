@@ -1,13 +1,11 @@
+name: testnet
+
 services:
   miner:
     build: .
-    container_name: miner
     command: ./start-miner.sh --test
     network_mode: "host"
-    environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      WANDB_API_KEY: ${WANDB_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL}
+    env_file: .env.test
     volumes:
       - ./:/app
       - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets/
@@ -18,13 +16,9 @@ services:
 
   validator:
     build: .
-    container_name: validator
     command: ./start-validator.sh --test --proxy.port 10914
     network_mode: "host"
-    environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      WANDB_API_KEY: ${WANDB_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL}
+    env_file: .env.test
     volumes:
       - ./:/app
       - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets/

@@ -224,5 +224,4 @@ if __name__ == "__main__":
     with Miner() as miner:
         while True:
             miner.check_for_thread_exception()
-            bt.logging.info(f"uid {miner.uid} tick")
             time.sleep(5)
