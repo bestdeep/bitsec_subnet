@@ -190,9 +190,6 @@ class ValidatorProxy:
         
         bt.logging.info(f"[ORGANIC] raw responses: {responses}")
 
-        # return predictions from miners
-        bt.logging.info(f"[ORGANIC] Checking predictions: {[(i, v.prediction, len(v.vulnerabilities) if v.vulnerabilities else 0) for i, v in enumerate(responses)]}")
-        
         # Filter valid responses and keep track of their corresponding UIDs
         valid_responses = []
         for uid, response in zip(miner_uids, responses):
@@ -202,6 +199,8 @@ class ValidatorProxy:
         bt.logging.info(f"[ORGANIC] Found {len(valid_responses)} valid responses")
         
         if valid_responses:
+            bt.logging.info(f"[ORGANIC] Checking predictions: {[(uid, r.prediction, len(r.vulnerabilities)) for uid, r in valid_responses]}")
+
             vulnerabilities_by_miner = []
 
             # Process each valid response

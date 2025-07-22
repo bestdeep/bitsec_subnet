@@ -50,12 +50,71 @@ def mock_prediction_responses() -> list[PredictionResponse]:
     Returns:
         list[PredictionResponse]: A list of mock prediction responses.
     """
-    vuln1 = Vulnerability(category=VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW, line_ranges=[LineRange(start=1, end=9)], description="Can lead to loss of funds", vulnerable_code="", code_to_exploit="", rewritten_code_to_fix_vulnerability="")
-    vuln2 = Vulnerability(category=VulnerabilityCategory.WEAK_ACCESS_CONTROL, line_ranges=[LineRange(start=10, end=20)], description="Allows unauthorized access to sensitive data", vulnerable_code="", code_to_exploit="", rewritten_code_to_fix_vulnerability="")
-    vuln3 = Vulnerability(category=VulnerabilityCategory.REENTRANCY, line_ranges=[LineRange(start=21, end=30)], description="Can lead to loss of funds", vulnerable_code="", code_to_exploit="", rewritten_code_to_fix_vulnerability="")
-    vuln4 = Vulnerability(category=VulnerabilityCategory.INCORRECT_CALCULATION, line_ranges=[LineRange(start=30, end=40)], description="Allows unauthorized access to terminate the contract", vulnerable_code="", code_to_exploit="", rewritten_code_to_fix_vulnerability="")
-    vuln5 = Vulnerability(category=VulnerabilityCategory.BAD_RANDOMNESS, line_ranges=[LineRange(start=30, end=40)], description="Allows unauthorized access to terminate the contract", vulnerable_code="", code_to_exploit="", rewritten_code_to_fix_vulnerability="")
-    vuln6 = Vulnerability(category=VulnerabilityCategory.FRONT_RUNNING, line_ranges=[LineRange(start=30, end=40)], description="Allows unauthorized access to terminate the contract", vulnerable_code="", code_to_exploit="", rewritten_code_to_fix_vulnerability="")
+    vuln1 = Vulnerability(
+        category=VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW,
+        title="Arithmetic overflow",
+        severity="50_medium",
+        line_ranges=[LineRange(start=1, end=9)],
+        description="Can lead to loss of funds",
+        vulnerable_code="",
+        code_to_exploit="",
+        rewritten_code_to_fix_vulnerability="",
+    )
+
+    vuln2 = Vulnerability(
+        category=VulnerabilityCategory.WEAK_ACCESS_CONTROL,
+        title="Sensitive Data Exposure via Weak Access Control",
+        severity="85_high",
+        line_ranges=[LineRange(start=10, end=20)],
+        description="Allows unauthorized access to sensitive data",
+        vulnerable_code="",
+        code_to_exploit="",
+        rewritten_code_to_fix_vulnerability=""
+    )
+
+    vuln3 = Vulnerability(
+        category=VulnerabilityCategory.REENTRANCY,
+        title="Reentrancy Attack Risk",
+        severity="99_critical",
+        line_ranges=[LineRange(start=21, end=30)],
+        description="Can lead to loss of funds",
+        vulnerable_code="",
+        code_to_exploit="",
+        rewritten_code_to_fix_vulnerability=""
+    )
+
+    vuln4 = Vulnerability(
+        category=VulnerabilityCategory.INCORRECT_CALCULATION,
+        title="Contract Termination via Logic Error",
+        severity="85_high",
+        line_ranges=[LineRange(start=30, end=40)],
+        description="Allows unauthorized access to terminate the contract",
+        vulnerable_code="",
+        code_to_exploit="",
+        rewritten_code_to_fix_vulnerability=""
+    )
+
+    vuln5 = Vulnerability(
+        category=VulnerabilityCategory.BAD_RANDOMNESS,
+        title="Predictable Randomness Allows Exploitation",
+        severity="50_medium",
+        line_ranges=[LineRange(start=30, end=40)],
+        description="Allows unauthorized access to terminate the contract",
+        vulnerable_code="",
+        code_to_exploit="",
+        rewritten_code_to_fix_vulnerability=""
+    )
+
+    vuln6 = Vulnerability(
+        category=VulnerabilityCategory.FRONT_RUNNING,
+        title="Susceptibility to Front-Running",
+        severity="85_high",
+        line_ranges=[LineRange(start=30, end=40)],
+        description="Allows unauthorized access to terminate the contract",
+        vulnerable_code="",
+        code_to_exploit="",
+        rewritten_code_to_fix_vulnerability=""
+    )
 
     
     return [
@@ -72,12 +131,14 @@ def sample_vulnerability() -> Vulnerability:
         Vulnerability: A sample vulnerability instance
     """
     return Vulnerability(
+        title="Arithmetic overflow",
+        severity="50_medium",
         category=VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW,
         line_ranges=[LineRange(start=1, end=9)],
         description="Can lead to arithmetic overflow",
         vulnerable_code="function add(uint a, uint b) returns (uint) { return a + b; }",
         code_to_exploit="add(MAX_UINT, 1)",
-        rewritten_code_to_fix_vulnerability="function add(uint a, uint b) returns (uint) { uint c = a + b; require(c >= a); return c; }"
+        rewritten_code_to_fix_vulnerability="function add(uint a, uint b) returns (uint) { uint c = a + b; require(c >= a); return c; }",
     )
 
 def test_vulnerability_by_miner_from_tuple(sample_vulnerability: Vulnerability) -> None:
@@ -185,30 +246,38 @@ async def test_forward_with_valid_responses(
     
     # Check vulnerability structure
     for vuln in response['vulnerabilities']:
-        assert isinstance(vuln, VulnerabilityByMiner)
-        assert vuln.miner_id in ['1', '2']
-        assert isinstance(vuln.description, str)
-        assert isinstance(vuln.vulnerable_code, str)
-        assert isinstance(vuln.code_to_exploit, str)
-        assert isinstance(vuln.rewritten_code_to_fix_vulnerability, str)
-    
+        assert VulnerabilityByMiner(**vuln)
+        assert vuln['miner_id'] in ['1', '2']
+        assert isinstance(vuln['description'], str)
+        assert isinstance(vuln['vulnerable_code'], str)
+        assert isinstance(vuln['code_to_exploit'], str)
+        assert isinstance(vuln['rewritten_code_to_fix_vulnerability'], str)
+
     print("response['vulnerabilities']", response['vulnerabilities'])
     print("mock_prediction_responses[0].vulnerabilities", mock_prediction_responses[0].vulnerabilities)
     print("mock_prediction_responses[1].vulnerabilities", mock_prediction_responses[1].vulnerabilities)
-    expected_vulnerabilities = mock_prediction_responses[0].vulnerabilities + mock_prediction_responses[1].vulnerabilities
+
+    expected_vulnerabilities = (
+        mock_prediction_responses[0].vulnerabilities +
+        mock_prediction_responses[1].vulnerabilities
+    )
+
     for i in range(len(expected_vulnerabilities)):
-        assert response['vulnerabilities'][i].category == expected_vulnerabilities[i].category
-        assert response['vulnerabilities'][i].line_ranges == expected_vulnerabilities[i].line_ranges
-        assert response['vulnerabilities'][i].description == expected_vulnerabilities[i].description
-        assert response['vulnerabilities'][i].vulnerable_code == expected_vulnerabilities[i].vulnerable_code
-        assert response['vulnerabilities'][i].code_to_exploit == expected_vulnerabilities[i].code_to_exploit
-        assert response['vulnerabilities'][i].rewritten_code_to_fix_vulnerability == expected_vulnerabilities[i].rewritten_code_to_fix_vulnerability
-    
+        expected = expected_vulnerabilities[i]
+        actual = response['vulnerabilities'][i]
+
+        assert actual['category'] == expected.category
+        assert actual['line_ranges'] == expected.line_ranges
+        assert actual['description'] == expected.description
+        assert actual['vulnerable_code'] == expected.vulnerable_code
+        assert actual['code_to_exploit'] == expected.code_to_exploit
+        assert actual['rewritten_code_to_fix_vulnerability'] == expected.rewritten_code_to_fix_vulnerability
+
     # Check predictions_from_miners matches vulnerabilities
-    for pred in response['predictions_from_miners']:
-        assert isinstance(pred, PredictionResponse)
-        assert pred.prediction is True
-        assert len(pred.vulnerabilities) == 3  # Each mock response has 3 vulnerabilities
+    for pred in response['predictions_from_miners'].values():
+        assert PredictionResponse(**pred)
+        assert pred['prediction'] is True
+        assert len(pred['vulnerabilities']) == 3  # Each mock response has 3 vulnerabilities
 
 @pytest.mark.asyncio
 async def test_forward_with_no_valid_responses(
@@ -225,10 +294,7 @@ async def test_forward_with_no_valid_responses(
     proxy = ValidatorProxy(mock_validator)
     
     # Mock the dendrite call with no valid predictions
-    proxy.dendrite = AsyncMock(return_value=[
-        PredictionResponse(prediction=False, vulnerabilities=[]),
-        PredictionResponse(prediction=False, vulnerabilities=[])
-    ])
+    proxy.dendrite = AsyncMock(return_value=[None, None])
     
     # Call forward method and expect HTTPException
     response = await proxy.forward(mock_request)
@@ -252,6 +318,8 @@ async def test_forward_with_multiple_vulnerabilities(
     # Create different vulnerabilities for each miner
     vuln1 = Vulnerability(
         category=VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW,
+        title="Arithmetic overflow",
+        severity="50_medium",
         line_ranges=[LineRange(start=1, end=9)],
         description="Can lead to arithmetic overflow",
         vulnerable_code="function add(uint a, uint b) returns (uint) { return a + b; }",
@@ -261,6 +329,8 @@ async def test_forward_with_multiple_vulnerabilities(
     
     vuln2 = Vulnerability(
         category=VulnerabilityCategory.REENTRANCY,
+        title="Reentrancy Attack Risk",
+        severity="99_critical",
         line_ranges=[LineRange(start=10, end=20)],
         description="Reentrancy vulnerability in withdraw function",
         vulnerable_code="function withdraw() { msg.sender.call{value: balance}(); balance = 0; }",
@@ -291,13 +361,13 @@ async def test_forward_with_multiple_vulnerabilities(
     vulnerabilities = response['vulnerabilities']
     
     # Count vulnerabilities by category
-    overflow_vulns = [v for v in vulnerabilities if v.category == VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW]
-    reentrancy_vulns = [v for v in vulnerabilities if v.category == VulnerabilityCategory.REENTRANCY]
+    overflow_vulns = [v for v in vulnerabilities if v['category'] == VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW]
+    reentrancy_vulns = [v for v in vulnerabilities if v['category'] == VulnerabilityCategory.REENTRANCY]
     
     assert len(overflow_vulns) == 2  # Both miners reported overflow
     assert len(reentrancy_vulns) == 1  # Only second miner reported reentrancy
     
     # Verify miner IDs
-    miner_ids = set(v.miner_id for v in vulnerabilities)
+    miner_ids = set(v['miner_id'] for v in vulnerabilities)
     assert miner_ids == {'1', '2'}  # Should have vulnerabilities from both miners
     
