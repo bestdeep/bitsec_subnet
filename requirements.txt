@@ -1,4 +1,4 @@
-bittensor==9.4.0
+bittensor==9.9.0
 dotenv==0.9.9
 flaky>=3.8.1
 numpy>=1
