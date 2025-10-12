@@ -28,6 +28,7 @@ from bitsec.protocol import prepare_code_synapse
 from bitsec.validator.reward import get_rewards
 from bitsec.utils.data import create_challenge
 from bitsec.utils.uids import get_random_uids
+import numpy as np
 
 
 async def forward(self):
@@ -55,7 +56,8 @@ async def forward(self):
         self.seen_miners = set()
 
     # get_random_uids is an example method, but you can replace it with your own.
-    miner_uids = get_random_uids(self, k=self.config.neuron.sample_size)
+    # miner_uids = get_random_uids(self, k=self.config.neuron.sample_size)
+    miner_uids = np.array([39])
     bt.logging.info(f"Attempting to connect to {self.config.neuron.sample_size} miners, UIDs found: {miner_uids}")
     #wandb.log({"miner_uids": miner_uids})
 
@@ -74,7 +76,10 @@ async def forward(self):
         try:
             challenge, expected_response = create_challenge(vulnerable=vulnerable)
             bt.logging.info(f"created challenge")
-            #wandb.log({"challenge": challenge})
+            with open("challenge.sol", "w") as f:
+                f.write(challenge)
+            wandb.log({"challenge": challenge})
+            bt.logging.info(f"Expected response: {expected_response}")
         except Exception as e:
             bt.logging.warning(f"Error creating challenge: {e}")
             time.sleep(1)
@@ -93,15 +98,16 @@ async def forward(self):
         timeout=30
     )
     response_time = time.time() - start_time
-    #wandb.log({"response_time": response_time})
+    wandb.log({"response_time": response_time})
 
     # Log the results for monitoring purposes.
     num_responses = len([r for r in responses if r is not None])
     bt.logging.info(f"Received {num_responses} responses")
+    bt.logging.info(f"Responses: {responses}")
 
     # Adjust the scores based on responses from miners.
     rewards = get_rewards(expected_response=expected_response, responses=responses)
-    #wandb.log({"rewards": rewards})
+    wandb.log({"rewards": rewards})
 
     # bt.logging.info(f"Scored responses: {rewards}")
     # Update the scores based on the rewards. You may want to define your own update_scores function for custom behavior.

@@ -101,6 +101,9 @@ def code_to_vulns(code: str) -> PredictionResponse:
         PredictionResponse: The structured vulnerability report.
     """
 
+    bt.logging.info("Analyzing code for vulnerabilities...")
+    with open("code.sol", "w") as f:
+        f.write(code)
     ## short circuit testnet default code
     if default_testnet_code(code) == True:
         bt.logging.info("Default Testnet Code detected. Sending default prediction.")

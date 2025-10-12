@@ -33,6 +33,6 @@ fi
 echo "Starting validator in $ENV environment with netuid $NETUID on port $PORT and proxy port $PROXY_PORT"
 $COMMAND_WITH_PATH -m neurons.validator --netuid $NETUID \
     --subtensor.chain_endpoint $NETWORK --subtensor.network $NETWORK \
-    --wallet.name "${WALLET_PREFIX}validator" --wallet.hotkey default \
+    --wallet.name "default" --wallet.hotkey "34-val" \
     --axon.port $PORT --axon.external_port $PORT \
     --logging.debug --proxy.port $PROXY_PORT
