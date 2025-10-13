@@ -1,5 +1,6 @@
 from bitsec.protocol import PredictionResponse
 from bitsec.miner.prompt import code_to_vulns
+import httpx
 
 ## Predicting vulnerabilities is a multifaceted task. Here are some example improvements:
 # - train custom model
@@ -18,5 +19,14 @@ def predict(code: str) -> PredictionResponse:
         PredictionResponse: The predicted output value and list of vulnerabilities.
     """
     
+    with httpx.Client(timeout=None) as client:
+        response = client.post("http://localhost:8000/predict", json={"code": code})
 
-    return code_to_vulns(code=code)
+        if response.status_code != 200:
+            return response.text
+
+        data = response.json()
+        vulnerabilities = data.get("vulnerabilities", {})
+        result = PredictionResponse.from_json(vulnerabilities)
+        print(f"Predicted vulnerabilities: {result}")
+        return result
