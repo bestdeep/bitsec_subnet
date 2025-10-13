@@ -25,7 +25,7 @@ if not os.getenv("CHUTES_API_KEY"):
     raise ValueError("Chutes API key is not set.")
 
 CHUTES_API_KEY = os.getenv("CHUTES_API_KEY")
-CHUTES_EMBEDDING_URL = "https://chutes-baai-bge-large-en-v1-5.chutes.ai/embed"
+CHUTES_EMBEDDING_URL = "https://chutes-sentence-transformers-all-minilm-l6-v2.chutes.ai/v1/embeddings"
 CHUTES_INFERENCE_URL = "https://llm.chutes.ai/v1/chat/completions"
 
 MODEL_PRICING: Dict[str, float] = {
@@ -72,10 +72,14 @@ DEFAULT_MAX_TOKENS = 10000
 TOTAL_SPEND_CENTS = 0.0
 TOTAL_SPEND_DESCRIPTION = []
 
-class GPTMessage(BaseModel):
-    """Model for GPT message structure"""
-    role: str = Field(..., description="Role of the message (user, assistant, system)")
-    content: str = Field(..., description="Content of the message")
+_HTTP_CLIENT: Optional[httpx.Client] = None
+
+def _get_http_client() -> httpx.Client:
+    """Get or create a reusable HTTP client for connection pooling"""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = httpx.Client(timeout=60.0)
+    return _HTTP_CLIENT
 
 class ChutesProvider:
     """Provider for Chutes API inference"""
@@ -113,11 +117,17 @@ class ChutesProvider:
         if not self.is_available():
             raise RuntimeError("Chutes API key not set")
 
+        if temperature is not None:
+            try:
+                temperature = float(temperature)
+            except (TypeError, ValueError):
+                console.print(f"Invalid temperature provided: {temperature}")
+                raise ValueError(f"Invalid temperature provided: {temperature}")
+
         model = model or DEFAULT_MODEL
         if not self.supports_model(model):
             model = "openai/gpt-oss-120b"
 
-        # Convert messages to dict format, normalizing content shape
         # Convert messages to dict format
         messages_dict = []
         if messages:
@@ -136,100 +146,74 @@ class ChutesProvider:
             "messages": messages_dict,
             "stream": True,
             "max_tokens": max_tokens,
-            "seed": random.randint(0, 2**32 - 1),
         }
-        # Only include temperature if it's explicitly provided (and numeric)
         if temperature is not None:
-            try:
-                body["temperature"] = float(temperature)
-            except (TypeError, ValueError):
-                console.print(f"Invalid temperature provided: {temperature}")
-                return f"Invalid temperature provided: {temperature}", 400
+            body["temperature"] = temperature
 
         response_text = ""
-        # Use a sensible timeout (you can tweak as needed)
-        timeout_seconds = 60.0
 
         try:
-            with httpx.Client(timeout=timeout_seconds) as client:
-                # .stream returns a Response object context manager for streaming
-                with client.stream("POST", CHUTES_INFERENCE_URL, headers=headers, json=body) as response:
+            client = _get_http_client()
+            with client.stream("POST", CHUTES_INFERENCE_URL, headers=headers, json=body) as response:
 
-                    if response.status_code != 200:
-                        # read() returns bytes or str depending on httpx version; handle both
-                        try:
-                            error_bytes = response.read()
-                            if isinstance(error_bytes, bytes):
-                                error_message = error_bytes.decode(errors="replace")
-                            else:
-                                error_message = str(error_bytes)
-                        except Exception:
-                            error_message = f"Chutes returned status {response.status_code} and body could not be read."
-
-                        console.print(
-                            f"Chutes API request failed (model: {model}): {response.status_code} - {error_message}"
-                        )
-                        # Return server error payload to caller for debugging
-                        return error_message, response.status_code
-
-                    # Process streaming response line-by-line
-                    for raw_line in response.iter_lines():
-                        if not raw_line:
-                            continue
-                        # raw_line can be bytes or str
-                        try:
-                            if isinstance(raw_line, bytes):
-                                line = raw_line.decode(errors="replace").strip()
-                            else:
-                                line = str(raw_line).strip()
-                        except Exception:
-                            continue
-
-                        # handle SSE-style "data: " prefix
-                        if line.startswith("data:"):
-                            chunk_data = line[len("data:"):].strip()
+                if response.status_code != 200:
+                    try:
+                        error_bytes = response.read()
+                        if isinstance(error_bytes, bytes):
+                            error_message = error_bytes.decode(errors="replace")
                         else:
-                            chunk_data = line
+                            error_message = str(error_bytes)
+                    except Exception:
+                        error_message = f"Chutes returned status {response.status_code} and body could not be read."
 
-                        if chunk_data == "[DONE]":
-                            break
+                    console.print(
+                        f"Chutes API request failed (model: {model}): {response.status_code} - {error_message}"
+                    )
+                    raise RuntimeError(f"Chutes API failed: {response.status_code} - {error_message}")
 
-                        # try decode JSON chunk, but be tolerant
-                        try:
-                            chunk_json = json.loads(chunk_data)
-                        except json.JSONDecodeError:
-                            # Not JSON — sometimes streaming returns raw text; append directly
-                            response_text += chunk_data
-                            continue
+                for raw_line in response.iter_lines():
+                    if not raw_line:
+                        continue
+                    
+                    try:
+                        if isinstance(raw_line, bytes):
+                            line = raw_line.decode(errors="replace").strip()
+                        else:
+                            line = str(raw_line).strip()
+                    except Exception:
+                        continue
 
-                        # typical structure: {"choices":[{"delta": {"content": "..."}}]}
-                        if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
-                            choice = chunk_json["choices"][0]
-                            # try delta.content path
-                            content_piece = None
-                            if isinstance(choice, dict):
-                                # handle "delta": {"content": "..."} (streaming) or "message"/"content"
-                                if "delta" in choice and isinstance(choice["delta"], dict):
-                                    content_piece = choice["delta"].get("content") or choice["delta"].get("text")
-                                elif "message" in choice and isinstance(choice["message"], dict):
-                                    # some APIs stream {"message": {"content": "..."}} 
-                                    msg = choice["message"]
-                                    content_piece = msg.get("content") or msg.get("text")
-                                else:
-                                    # fallback: try top-level "text" or "content"
-                                    content_piece = choice.get("text") or choice.get("content")
-                            if content_piece:
-                                # if content_piece is dict, try extract "text"
-                                if isinstance(content_piece, dict):
-                                    response_text += content_piece.get("text", "")
-                                else:
-                                    response_text += str(content_piece)
+                    # handle SSE-style "data: " prefix
+                    if line.startswith("data:"):
+                        chunk_data = line[len("data:"):].strip()
+                    else:
+                        chunk_data = line
+
+                    if chunk_data == "[DONE]":
+                        break
+
+                    # try decode JSON chunk
+                    try:
+                        chunk_json = json.loads(chunk_data)
+                    except json.JSONDecodeError:
+                        # Not JSON — append directly
+                        response_text += chunk_data
+                        continue
+
+                    if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                        choice = chunk_json["choices"][0]
+                        if isinstance(choice, dict):
+                            # Try delta.content first (streaming format)
+                            delta = choice.get("delta", {})
+                            if isinstance(delta, dict):
+                                content = delta.get("content", "")
+                                if content:
+                                    response_text += str(content)
 
         except Exception as e:
             console.print(f"Error in Chutes API request: {e}")
-            return f"Error in Chutes API request: {str(e)}", 500
+            raise
 
-        # At this point we collected response_text from the stream
         console.print(f"Chutes raw response text: {response_text}")
         return response_text, 200
 
@@ -240,18 +224,27 @@ class ChutesProvider:
             "Content-Type": "application/json",
         }
 
-        body = {"inputs": input_text, "seed": random.randint(0, 2**32 - 1)}
+        # body = {"inputs": input_text}
+        body = {
+            "input": input_text,
+            "model": None
+            }
 
         try:
-            with httpx.Client(timeout=60) as client:
-                response = client.post(CHUTES_EMBEDDING_URL, headers=headers, json=body)
-                response.raise_for_status()
-                return response.json()
+            client = _get_http_client()
+            response = client.post(CHUTES_EMBEDDING_URL, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            data = data.get("data", [])
+            if not data or not isinstance(data, list) or "embedding" not in data[0]:
+                raise RuntimeError("Invalid embedding response from Chutes")
+            embedding = data[0]["embedding"]
+            return embedding
         except httpx.HTTPStatusError as e:
-            return {"error": f"HTTP {e.response.status_code}: {e.response.text}"}
+            raise RuntimeError(f"HTTP {e.response.status_code}: {e.response.text}")
         except httpx.TimeoutException:
-            return {"error": "Embedding request timed out"}
+            raise TimeoutError("Embedding request timed out")
         except Exception as e:
-            return {"error": f"Embedding error: {str(e)}"}
+            raise RuntimeError(f"Embedding error: {str(e)}")
             
 chutes_client = ChutesProvider()

@@ -2,8 +2,8 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from endpoint.predict import code_to_vulns
-from endpoint.solidity_comparator import SolidityComparator
-from time import time, monotonic
+from endpoint.solidity_comparator import SolidityComparatorFastLoadOpt
+from time import monotonic
 import asyncio
 import hashlib
 from collections import OrderedDict
@@ -51,7 +51,7 @@ class VulnerabilityAPI:
     def __init__(self, lru_size: int = 1024, lru_ttl: float = 300.0):
         self.app = FastAPI()
         self._setup_routes()
-        self.comparator = SolidityComparator()
+        self.comparator = SolidityComparatorFastLoadOpt()
 
         # Cache: completed results
         self._result_cache = _LRUCache(maxsize=lru_size, ttl=lru_ttl)
@@ -60,9 +60,9 @@ class VulnerabilityAPI:
         # Lock protecting _in_progress dict
         self._in_progress_lock = asyncio.Lock()
 
-        start_time = time()
-        self.comparator.load_candidates("samples/clean-codebases")
-        end_time = time()
+        start_time = monotonic()
+        # self.comparator.load_candidates("samples/clean-codebases")
+        end_time = monotonic()
         print(f"Loaded candidates in {end_time - start_time:.2f} seconds")
 
     def _setup_routes(self):
@@ -102,13 +102,12 @@ class VulnerabilityAPI:
 
             # If we get here, this coroutine is responsible for computing the result.
             try:
-                # comparator.compare_with_base_src may be CPU-bound; run in executor
-                start_time = time()
+                start_time = monotonic()
                 loop = asyncio.get_running_loop()
                 compare_results = None
-                compare_results = await loop.run_in_executor(
-                    None, self.comparator.compare_with_base_src, code, 1, None, False, None, 100
-                )
+                # compare_results = await loop.run_in_executor(
+                #     None, self.comparator.compare_with_base_src, code, 1, None, False, None, 100
+                # )
                 # handle compare_results possibly empty
                 compare_for_predict = compare_results[0] if compare_results else {}
                 # call code_to_vulns (assumed cheap); if expensive, also move to executor
@@ -121,7 +120,7 @@ class VulnerabilityAPI:
 
                 # set the future result for waiters
                 fut.set_result(result)
-                end_time = time()
+                end_time = monotonic()
                 print(f"Processed request in {end_time - start_time:.2f} seconds")
                 return {"vulnerabilities": result}
             except Exception as exc:

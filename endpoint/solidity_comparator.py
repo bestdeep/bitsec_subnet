@@ -1,109 +1,75 @@
 #!/usr/bin/env python3
 """
-solidity_comparator.py
+solidity_comparator_fast_loadopt.py
 
-A class-based module to compare a base Solidity file to many .sol candidates in a directory,
-ignoring comments and formatting differences, and running comparisons in parallel.
+Fast comparator with optimized loading for very large candidate sets (~10k-50k).
+Features:
+ - Persistent cache of preprocessed candidates (validated by file mtimes & sizes).
+ - Parallel preprocessing with ProcessPoolExecutor (faster for CPU-heavy normalization + hashing).
+ - Optional smaller "worker" pickle to reduce worker memory footprint.
+ - MinHash-based shortlist and accurate difflib SequenceMatcher on shortlist.
 
-Key features:
- - Loads candidate files once (in main process) and serializes them to a temporary pickle.
- - Worker processes use an initializer to load candidates from that pickle once per worker.
- - Uses difflib.SequenceMatcher on normalized lines for differences and maps them back to original line numbers.
- - Returns top-N matches with difference ranges and optional unified diff of normalized content.
-
-Usage example:
-    from solidity_comparator import SolidityComparator
-
-    sc = SolidityComparator()
+Usage:
+    sc = SolidityComparatorFastLoadOpt(minhash_k=64, shortlist_k=200)
     sc.load_candidates("/path/to/candidates", recursive=True)
-    results = sc.compare_with_base("/path/to/base.sol", top=3, workers=8, include_diff=True)
-    for r in results:
-        print(r['candidate'], r['total_changed_lines'])
+    results = sc.compare_with_base("/path/to/base.sol", top=3, workers=8)
 """
 
 from pathlib import Path
 import re
 import difflib
-import json
-import tempfile
 import pickle
+import tempfile
 import os
+import hashlib
+import random
+import json
 from typing import List, Tuple, Dict, Optional
 import concurrent.futures
 import multiprocessing
-import functools
+from functools import partial
+from time import time
+from itertools import repeat
+from tqdm import tqdm
+try:
+    import xxhash
+    _USE_XXHASH = True
+except Exception:
+    _USE_XXHASH = False
 
-# ---------------------------------------------------------------------
-# Low-level parsing and normalization (same semantics as previous scripts)
-# ---------------------------------------------------------------------
-def strip_comments_preserve_lines(source: str) -> List[Tuple[int, str]]:
-    result_lines: List[Tuple[int, str]] = []
-    i = 0
-    n = len(source)
-    lineno = 1
-    cur_chars: List[str] = []
+def _process_file_for_load(p_path_str: str, exclude_set: set, a_list: List[int], b_list: List[int], PRIME: int) -> Optional[Dict]:
+    """
+    Top-level helper used by ProcessPoolExecutor.map to process a single file.
+    Returns the candidate dict or None on failure / excluded path.
+    """
+    try:
+        p = Path(p_path_str)
+        pr = str(p.resolve())
+        if pr in exclude_set:
+            return None
+        src = p.read_text(encoding="utf-8")
+    except Exception:
+        return None
 
-    in_block = False
-    in_string = False
-    string_delim = None
-    while i < n:
-        ch = source[i]
+    try:
+        lines_with_nums = strip_comments_preserve_lines_with_orig(src)
+        norm_lines, orig_ranges = build_normalized_sequence_with_orig(lines_with_nums)
+        line_hashes = [_hash_line_to_int(ln) for ln in norm_lines]
+        minhash_sig = compute_minhash_signature(line_hashes, a_list, b_list, PRIME)
+        return {
+            "path": pr,
+            "norm_lines": norm_lines,
+            "orig_ranges": orig_ranges,
+            "line_hashes": line_hashes,
+            "minhash_sig": minhash_sig
+        }
+    except Exception:
+        return None
 
-        if in_block:
-            if ch == '*' and i + 1 < n and source[i+1] == '/':
-                in_block = False
-                i += 2
-                continue
-            if ch == '\n':
-                result_lines.append((lineno, "".join(cur_chars)))
-                cur_chars = []
-                lineno += 1
-            i += 1
-            continue
-
-        if in_string:
-            if ch == '\\' and i + 1 < n:
-                cur_chars.append(ch); cur_chars.append(source[i+1]); i += 2; continue
-            if ch == string_delim:
-                cur_chars.append(ch); in_string = False; string_delim = None; i += 1; continue
-            if ch == '\n':
-                cur_chars.append(ch); result_lines.append((lineno, "".join(cur_chars))); cur_chars = []; lineno += 1; i += 1; continue
-            cur_chars.append(ch); i += 1; continue
-
-        if ch == '"' or ch == "'":
-            in_string = True; string_delim = ch; cur_chars.append(ch); i += 1; continue
-
-        if ch == '/' and i + 1 < n and source[i+1] == '*':
-            in_block = True; i += 2; continue
-
-        if ch == '/' and i + 1 < n and source[i+1] == '/':
-            i += 2
-            while i < n and source[i] not in '\n\r':
-                i += 1
-            continue
-
-        if ch == '\r':
-            i += 1; continue
-
-        if ch == '\n':
-            result_lines.append((lineno, "".join(cur_chars)))
-            cur_chars = []
-            lineno += 1
-            i += 1
-            continue
-
-        cur_chars.append(ch)
-        i += 1
-
-    if cur_chars or lineno == 1:
-        result_lines.append((lineno, "".join(cur_chars)))
-    return result_lines
-
+# ----------------------------
+# Parsing & normalization (line-aware, preserve original line numbers)
+# ----------------------------
 def strip_comments_preserve_lines_with_orig(source: str) -> List[Tuple[List[int], str]]:
-    """
-    Returns a list of tuples: (original_line_numbers, text_after_removing_comments)
-    original_line_numbers: list of line numbers in the original file corresponding to this line
-    """
     result_lines: List[Tuple[List[int], str]] = []
     i = 0
     n = len(source)
@@ -119,14 +85,12 @@ def strip_comments_preserve_lines_with_orig(source: str) -> List[Tuple[List[int]
         ch = source[i]
         cur_orig_lines.append(lineno)
 
-        # Handle block comment
         if in_block:
             if ch == '*' and i + 1 < n and source[i+1] == '/':
                 in_block = False
                 i += 2
                 continue
             if ch == '\n':
-                # Append empty string for commented lines
                 result_lines.append((cur_orig_lines.copy(), "".join(cur_chars)))
                 cur_chars = []
                 cur_orig_lines = []
@@ -134,7 +98,6 @@ def strip_comments_preserve_lines_with_orig(source: str) -> List[Tuple[List[int]
             i += 1
             continue
 
-        # Handle string literals
         if in_string:
             if ch == '\\' and i + 1 < n:
                 cur_chars.append(ch); cur_chars.append(source[i+1]); i += 2; continue
@@ -149,15 +112,12 @@ def strip_comments_preserve_lines_with_orig(source: str) -> List[Tuple[List[int]
                 continue
             cur_chars.append(ch); i += 1; continue
 
-        # Start string
         if ch == '"' or ch == "'":
             in_string = True; string_delim = ch; cur_chars.append(ch); i += 1; continue
 
-        # Start block comment
         if ch == '/' and i + 1 < n and source[i+1] == '*':
             in_block = True; i += 2; continue
 
-        # Single-line comment
         if ch == '/' and i + 1 < n and source[i+1] == '/':
             i += 2
             while i < n and source[i] not in '\n\r':
@@ -194,23 +154,7 @@ def normalize_line(line: str) -> str:
     s = _PUNCT_RE_AFTER.sub(r"\1", s)
     return s.strip()
 
-def build_normalized_sequence(lines_with_numbers: List[Tuple[int, str]]) -> Tuple[List[str], List[int]]:
-    norm_lines: List[str] = []
-    orig_nums: List[int] = []
-    for lineno, raw in lines_with_numbers:
-        n = normalize_line(raw)
-        if n == "":
-            continue
-        norm_lines.append(n)
-        orig_nums.append(lineno)
-    return norm_lines, orig_nums
-
 def build_normalized_sequence_with_orig(lines_with_orig: List[Tuple[List[int], str]]) -> Tuple[List[str], List[Tuple[int,int]]]:
-    """
-    Returns:
-       - normalized lines
-       - original line ranges: list of tuples (start_line, end_line) in original file
-    """
     norm_lines: List[str] = []
     orig_ranges: List[Tuple[int,int]] = []
     for orig_lines, raw in lines_with_orig:
@@ -218,53 +162,51 @@ def build_normalized_sequence_with_orig(lines_with_orig: List[Tuple[List[int], s
         if n == "":
             continue
         norm_lines.append(n)
-        orig_ranges.append((orig_lines[0], orig_lines[-1]))  # first and last original line numbers
+        orig_ranges.append((orig_lines[0], orig_lines[-1]))
     return norm_lines, orig_ranges
 
-def diff_normalized_sequences(base_lines: List[str], base_nums: List[int],
-                              other_lines: List[str], other_nums: List[int]) -> Dict:
-    sm = difflib.SequenceMatcher(a=base_lines, b=other_lines, autojunk=False)
-    opcodes = sm.get_opcodes()
-    ranges = []
-    total_changed = 0
+# ----------------------------
+# MinHash helpers
+# ----------------------------
+def _hash_line_to_int(line: str) -> int:
+    # prefer xxhash for speed if available
+    if _USE_XXHASH:
+        # xxh64 returns 64-bit int
+        return xxhash.xxh64(line.encode("utf-8")).intdigest()
+    else:
+        h = hashlib.sha1(line.encode("utf-8")).digest()
+        return int.from_bytes(h[:8], "big", signed=False)
 
-    for tag, a1, a2, b1, b2 in opcodes:
-        if tag == 'equal':
-            continue
-        base_range = None
-        other_range = None
-        base_count = 0
-        other_count = 0
+def make_minhash_funcs(k: int, seed: int = 12345):
+    rnd = random.Random(seed)
+    PRIME = 18446744073709551557
+    a = [rnd.randrange(1, PRIME - 1) for _ in range(k)]
+    b = [rnd.randrange(0, PRIME - 1) for _ in range(k)]
+    return a, b, PRIME
 
-        if a1 < a2:
-            start_ln = base_nums[a1]
-            end_ln = base_nums[a2-1]
-            base_range = (start_ln, end_ln)
-            base_count = a2 - a1
-        if b1 < b2:
-            start_ln2 = other_nums[b1]
-            end_ln2 = other_nums[b2-1]
-            other_range = (start_ln2, end_ln2)
-            other_count = b2 - b1
+def compute_minhash_signature(line_hashes: List[int], a_list, b_list, PRIME) -> List[int]:
+    if not line_hashes:
+        return [2**63 - 1] * len(a_list)
+    sig = []
+    for a, b in zip(a_list, b_list):
+        minv = None
+        for x in line_hashes:
+            val = ((a * (x % PRIME)) + b) % PRIME
+            if minv is None or val < minv:
+                minv = val
+        sig.append(minv if minv is not None else 2**63 - 1)
+    return sig
 
-        total_changed += base_count + other_count
+def minhash_similarity(sig_a: List[int], sig_b: List[int]) -> float:
+    if not sig_a or not sig_b:
+        return 0.0
+    assert len(sig_a) == len(sig_b)
+    eq = sum(1 for x,y in zip(sig_a, sig_b) if x == y)
+    return eq / len(sig_a)
 
-        ranges.append({
-            "tag": tag,
-            "base_index_range": (a1, a2),
-            "other_index_range": (b1, b2),
-            "base_line_range": base_range,
-            "other_line_range": other_range,
-            "base_snippet": "\n".join(base_lines[a1:a2]),
-            "other_snippet": "\n".join(other_lines[b1:b2])
-        })
-
-    return {
-        "opcodes": opcodes,
-        "ranges": ranges,
-        "total_changed_lines": total_changed
-    }
-
+# ----------------------------
+# Diff using original ranges
+# ----------------------------
 def diff_normalized_sequences_with_orig(base_lines, base_orig_ranges, other_lines, other_orig_ranges):
     sm = difflib.SequenceMatcher(a=base_lines, b=other_lines, autojunk=False)
     ranges = []
@@ -275,13 +217,9 @@ def diff_normalized_sequences_with_orig(base_lines, base_orig_ranges, other_line
             continue
         base_range = base_orig_ranges[a1:a2]
         other_range = other_orig_ranges[b1:b2]
-
-        # Merge line ranges into single tuple (start, end)
         base_ln = (base_range[0][0], base_range[-1][1]) if base_range else None
         other_ln = (other_range[0][0], other_range[-1][1]) if other_range else None
-
         total_changed += (a2 - a1) + (b2 - b1)
-
         ranges.append({
             "tag": tag,
             "base_line_range": base_ln,
@@ -292,44 +230,49 @@ def diff_normalized_sequences_with_orig(base_lines, base_orig_ranges, other_line
 
     return {"ranges": ranges, "total_changed_lines": total_changed}
 
-# ---------------------------------------------------------------------
-# Worker-global variable(s) loaded by initializer
-# ---------------------------------------------------------------------
-_WORKER_CANDIDATES = None  # will be List[dict] where each dict has keys: path, norm_lines, orig_nums
+# ----------------------------
+# Worker-global storage for initializer
+# ----------------------------
+_WORKER_CANDIDATES = None
+_WORKER_BASE = None
 
-def _worker_initializer(pickle_path: str):
-    """
-    ProcessPoolExecutor initializer: load the pickled candidates into a process-global variable.
-    This is run once per worker process.
-    """
-    global _WORKER_CANDIDATES
+def _worker_initializer(cands_pickle_path: str, base_pickle_path: Optional[str]):
+    global _WORKER_CANDIDATES, _WORKER_BASE
     try:
-        with open(pickle_path, "rb") as f:
+        with open(cands_pickle_path, "rb") as f:
             _WORKER_CANDIDATES = pickle.load(f)
     except Exception as e:
-        # If loading fails, set to empty list and we will report errors in compare.
         _WORKER_CANDIDATES = []
-        # avoid printing in workers in normal runs; raise to make failures visible
-        raise RuntimeError(f"Worker failed to load candidates from {pickle_path}: {e}")
+        raise RuntimeError(f"Worker failed to load candidates: {e}")
 
-def _compare_candidate_worker(idx_and_base, include_diff: bool=False):
-    """
-    Worker function that expects a tuple (candidate_index, base_norm_lines, base_nums, pickle_path)
-    but because we use initializer, we only need candidate_index, base_norm_lines, base_nums, include_diff.
-    To keep pickling small, we pass base_norm_lines/base_nums as arguments and only candidate index is used to pick candidate from _WORKER_CANDIDATES.
-    """
-    candidate_index, base_norm_lines, base_nums, include_diff = idx_and_base
-    global _WORKER_CANDIDATES
+    if base_pickle_path:
+        try:
+            with open(base_pickle_path, "rb") as f:
+                _WORKER_BASE = pickle.load(f)
+        except Exception as e:
+            _WORKER_BASE = None
+            raise RuntimeError(f"Worker failed to load base: {e}")
+
+def _compare_candidate_worker(arg):
+    candidate_index, include_diff = arg
+    global _WORKER_CANDIDATES, _WORKER_BASE
     try:
         cand = _WORKER_CANDIDATES[candidate_index]
     except Exception as e:
         return {"candidate": None, "error": f"candidate_lookup_error: {e}"}
 
+    if not _WORKER_BASE:
+        return {"candidate": cand.get("path"), "error": "base_not_loaded_in_worker"}
+
     cand_path = cand["path"]
     other_norm_lines = cand["norm_lines"]
-    other_nums = cand["orig_nums"]
+    other_orig_ranges = cand["orig_ranges"]
 
-    diff_info = diff_normalized_sequences_with_orig(base_norm_lines, base_nums, other_norm_lines, other_nums)
+    base_norm_lines = _WORKER_BASE["norm_lines"]
+    base_orig_ranges = _WORKER_BASE["orig_ranges"]
+
+    diff_info = diff_normalized_sequences_with_orig(base_norm_lines, base_orig_ranges,
+                                                    other_norm_lines, other_orig_ranges)
     result = {
         "candidate": cand_path,
         "total_changed_lines": diff_info["total_changed_lines"],
@@ -337,6 +280,7 @@ def _compare_candidate_worker(idx_and_base, include_diff: bool=False):
         "num_norm_base_lines": len(base_norm_lines),
         "num_norm_other_lines": len(other_norm_lines)
     }
+
     if include_diff:
         a_text = "\n".join(base_norm_lines)
         b_text = "\n".join(other_norm_lines)
@@ -347,182 +291,319 @@ def _compare_candidate_worker(idx_and_base, include_diff: bool=False):
         result["unified_diff_normalized"] = "\n".join(ud)
     return result
 
-# ---------------------------------------------------------------------
-# Public class
-# ---------------------------------------------------------------------
-class SolidityComparator:
-    """
-    Class-based comparator.
+# ----------------------------
+# Cache helpers
+# ----------------------------
+def _make_dir_snapshot(directory: Path, recursive: bool) -> List[Tuple[str, float, int]]:
+    files = list(directory.rglob("*.sol")) if recursive else list(directory.glob("*.sol"))
+    entries = []
+    for p in files:
+        if p.is_file():
+            st = p.stat()
+            entries.append((str(p.resolve()), st.st_mtime, st.st_size))
+    entries.sort()
+    return entries
 
-    Typical usage:
-        sc = SolidityComparator()
-        sc.load_candidates("/path/to/dir", recursive=True)
-        results = sc.compare_with_base("/path/to/base.sol", top=1, workers=4, include_diff=True)
+def _snapshot_hash(entries: List[Tuple[str, float, int]]) -> str:
+    m = hashlib.sha1()
+    for path, mtime, size in entries:
+        m.update(path.encode("utf-8"))
+        m.update(str(int(mtime)).encode("utf-8"))
+        m.update(str(size).encode("utf-8"))
+    return m.hexdigest()
 
-    Methods:
-      - load_candidates(directory, recursive=False): load and normalize all candidate .sol files (and serialize them to a temp pickle).
-      - compare_with_base(base_path, top=1, workers=None, include_diff=False, timeout=None): run parallel comparisons and return top matches.
-      - cleanup(): remove internal temp pickle file (optional; done automatically on object delete).
-    """
-    def __init__(self):
+# ----------------------------
+# Main class
+# ----------------------------
+class SolidityComparatorFastLoadOpt:
+    def __init__(self, minhash_k: int = 64, minhash_seed: int = 12345, shortlist_k: int = 200,
+                 chunksize: int = 8, cache_dir: Optional[str] = None):
         self._candidates: List[Dict] = []
         self._pickle_path: Optional[str] = None
+        self.minhash_k = minhash_k
+        self.minhash_seed = minhash_seed
+        self.shortlist_k = shortlist_k
+        self.chunksize = chunksize
+        self._a_list, self._b_list, self._PRIME = make_minhash_funcs(self.minhash_k, seed=self.minhash_seed)
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
-    def load_candidates(self, directory: str, recursive: bool=False, exclude_paths: Optional[List[str]]=None):
+    def _cache_paths(self, base_dir: Path) -> Tuple[Path, Path]:
+        # cache files: full and worker-minimal
+        base_hash_file = base_dir / ".solcmp_cache_meta.json"
+        # use snapshot hash for file set
+        return (base_hash_file.with_suffix(".full.pkl"), base_hash_file.with_suffix(".worker.pkl"))
+
+    def load_candidates(self, directory: str, recursive: bool = False, exclude_paths: Optional[List[str]] = None,
+                        use_cache: bool = True, max_workers: Optional[int] = None, build_cache_only: bool = False):
         """
-        Load candidate .sol files from `directory` (string path). This reads the files into memory,
-        strips comments, normalizes per-line, and stores: path, norm_lines, orig_nums.
-        Then writes the entire structure to a temporary pickle file for worker initializer use.
-
-        - exclude_paths: optional list of file paths to exclude (absolute or relative).
+        Load candidate .sol files, with progress bar and optional build-cache-only mode.
+        If build_cache_only is True, this builds the caches then returns (useful for precomputing).
         """
         directory = Path(directory)
         if not directory.is_dir():
             raise FileNotFoundError(f"Directory not found: {directory}")
 
-        exclude_set = set()
-        if exclude_paths:
-            exclude_set = set(str(Path(p).resolve()) for p in exclude_paths)
+        exclude_set = set(str(Path(p).resolve()) for p in exclude_paths) if exclude_paths else set()
 
-        files = list(directory.rglob("*.sol")) if recursive else list(directory.glob("*.sol"))
-        files = [p for p in files if p.is_file()]
-        cand_list = []
-        for p in files:
-            pr = str(p.resolve())
-            if pr in exclude_set:
-                continue
+        # snapshot and cache paths
+        entries = _make_dir_snapshot(directory, recursive)
+        snap_hash = _snapshot_hash(entries)
+        cache_dir = Path(self.cache_dir) if self.cache_dir else directory
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        full_cache_path = cache_dir / f"solcmp_full_{snap_hash}.pkl"
+        worker_cache_path = cache_dir / f"solcmp_worker_{snap_hash}.pkl"
+
+        # quick load if caches exist and not forced to rebuild
+        if use_cache and full_cache_path.exists() and worker_cache_path.exists() and not build_cache_only:
             try:
-                src = p.read_text(encoding="utf-8")
-            except Exception as e:
-                # skip unreadable file but continue
-                continue
-            lines_with_nums = strip_comments_preserve_lines(src)
-            norm_lines, orig_nums = build_normalized_sequence(lines_with_nums)
-            cand_list.append({
-                "path": pr,
-                "norm_lines": norm_lines,
-                "orig_nums": orig_nums
-            })
+                with open(worker_cache_path, "rb") as f:
+                    self._candidates = pickle.load(f)
+                    self._pickle_path = str(worker_cache_path)
+                    return
+            except Exception:
+                pass
 
-        self._candidates = cand_list
+        files = [Path(p) for p,_,__ in entries if Path(p).is_file()]
+        n_files = len(files)
+        if max_workers is None:
+            max_workers = max(1, min(64, (os.cpu_count() or 4) * 2))
 
-        # serialize to temp pickle for worker initializer
-        fd, ppath = tempfile.mkstemp(prefix="sol_cmp_cands_", suffix=".pkl")
-        os.close(fd)
-        with open(ppath, "wb") as f:
-            pickle.dump(self._candidates, f)
-        self._pickle_path = ppath
+        # use top-level helper _process_file_for_load (must be defined at module level)
+        from itertools import repeat
+        cand_list = []
+        # Use ProcessPoolExecutor and as_completed to get progress updates
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futures = []
+            for p in files:
+                futures.append(ex.submit(_process_file_for_load,
+                                        str(p),
+                                        exclude_set,
+                                        self._a_list,
+                                        self._b_list,
+                                        self._PRIME))
+            for fut in tqdm(concurrent.futures.as_completed(futures), total=n_files, desc="Preprocessing candidates"):
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = None
+                if res:
+                    cand_list.append(res)
 
-    def compare_with_base(self, base_path: str, top: int=1, workers: Optional[int]=None,
-                          include_diff: bool=False, timeout: Optional[float]=None, max_allowed_changes=10) -> List[Dict]:
-        """
-        Compare base_path to loaded candidates in parallel.
+        # Save full cache and worker-minimal cache
+        try:
+            with open(full_cache_path, "wb") as f:
+                pickle.dump(cand_list, f, protocol=pickle.HIGHEST_PROTOCOL)
+            worker_list = [{"path": c["path"], "norm_lines": c["norm_lines"], "orig_ranges": c["orig_ranges"]} for c in cand_list]
+            with open(worker_cache_path, "wb") as f:
+                pickle.dump(worker_list, f, protocol=pickle.HIGHEST_PROTOCOL)
+            self._candidates = worker_list
+            self._pickle_path = str(worker_cache_path)
+        except Exception as e:
+            # fallback to in-memory only
+            self._candidates = cand_list
+            self._pickle_path = None
 
-        - top: how many top matches to return (sorted by least total_changed_lines).
-        - workers: number of worker processes (default = cpu_count()).
-        - include_diff: whether to include unified diff of normalized content.
-        - timeout: optional overall timeout in seconds for the entire operation (None means no timeout).
-        """
-        if not self._candidates or not self._pickle_path:
-            raise RuntimeError("Candidates not loaded. Call load_candidates() first.")
+        if build_cache_only:
+            print(f"Built cache: full={full_cache_path}, worker={worker_cache_path}")
+            return
 
+
+    # compare base convenience
+    def compare_with_base(self, base_path: str, top: int = 1, workers: Optional[int] = None,
+                          include_diff: bool = False, timeout: Optional[float] = None,
+                          shortlist_k: Optional[int] = None) -> List[Dict]:
         base_path = Path(base_path)
         if not base_path.is_file():
             raise FileNotFoundError(f"Base file not found: {base_path}")
-
-        # parse base once in main process
         base_src = base_path.read_text(encoding="utf-8")
+        return self.compare_with_base_src(base_src, top=top, workers=workers, include_diff=include_diff, timeout=timeout, shortlist_k=shortlist_k)
 
-        return self.compare_with_base_src(base_src, top=top, workers=workers, include_diff=include_diff, timeout=timeout, max_allowed_changes=max_allowed_changes)
-
-    def compare_with_base_src(self, base_src: str, top: int=1, workers: Optional[int]=None,
-                              include_diff: bool=False, timeout: Optional[float]=None,
-                              max_allowed_changes: Optional[int]=None) -> List[Dict]:
+    def compare_with_base_src(self, base_src: str, top: int = 1, workers: Optional[int] = None,
+                          include_diff: bool = False, timeout: Optional[float] = None,
+                          shortlist_k: Optional[int] = None) -> List[Dict]:
         """
-        Compare base_src to loaded candidates in parallel.
-
-        - top: how many top matches to return (sorted by least total_changed_lines).
-        - workers: number of worker processes (default = cpu_count()).
-        - include_diff: whether to include unified diff of normalized content.
-        - timeout: optional overall timeout in seconds for the entire operation (None means no timeout).
-        - max_allowed_changes: if set, any candidate with more total_changed_lines than this will be ignored.
+        Faster compare_with_base_src:
+        - Precomputes missing candidate minhash signatures in parallel (once).
+        - Then computes minhash similarity cheaply in-process.
+        - Shortlists and runs expensive diffs on shortlist.
         """
-        if not self._candidates or not self._pickle_path:
+        start_time = time()
+        if not self._candidates:
             raise RuntimeError("Candidates not loaded. Call load_candidates() first.")
+        if shortlist_k is None:
+            shortlist_k = self.shortlist_k
 
-        base_lines_with_numbers = strip_comments_preserve_lines(base_src)
-        base_norm_lines, base_nums = build_normalized_sequence(base_lines_with_numbers)
+        # Normalize base
+        t0 = time()
+        base_lines_with_numbers = strip_comments_preserve_lines_with_orig(base_src)
+        base_norm_lines, base_orig_ranges = build_normalized_sequence_with_orig(base_lines_with_numbers)
+        base_line_hashes = [_hash_line_to_int(ln) for ln in base_norm_lines]
+        base_sig = compute_minhash_signature(base_line_hashes, self._a_list, self._b_list, self._PRIME)
+        t_base = time() - t0
 
+        # Determine which candidates are missing minhash_sig (or line_hashes)
+        missing_indices = []
+        for idx, cand in enumerate(self._candidates):
+            if "minhash_sig" not in cand or cand["minhash_sig"] is None:
+                # if we do have line_hashes we can compute minhash quickly; otherwise compute line_hashes then sig
+                missing_indices.append(idx)
+
+        if missing_indices:
+            # parallel compute missing signatures
+            t1 = time()
+            if workers is None:
+                workers = max(1, min(os.cpu_count() or 4, len(missing_indices)))
+            # worker helper (module-level) to compute minhash signature for a single candidate index
+            # We'll create an argument list (index, a_list, b_list, PRIME) and map to a module-level helper
+            def _compute_sig_for_index(idx):
+                cand = self._candidates[idx]
+                # try using cached line_hashes
+                if "line_hashes" in cand and cand["line_hashes"]:
+                    lh = cand["line_hashes"]
+                else:
+                    # compute line hashes from norm_lines
+                    lh = [_hash_line_to_int(ln) for ln in cand["norm_lines"]]
+                    cand["line_hashes"] = lh
+                sig = compute_minhash_signature(lh, self._a_list, self._b_list, self._PRIME)
+                # store back in the candidate dict for reuse
+                cand["minhash_sig"] = sig
+                return idx  # return index to indicate completion
+
+            # Run in a process pool (CPU bound). Use map with chunksize to be efficient.
+            # Use a ProcessPoolExecutor because compute_minhash_signature may be CPU intensive.
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+                # Submit tasks for missing indices
+                # We use submit+as_completed so we can update progress / measure time
+                futures = {ex.submit(_compute_sig_for_index, idx): idx for idx in missing_indices}
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        # if a worker fails, print and continue: we remove that candidate from selection
+                        print(f"Warning: failed to compute minhash for candidate idx {futures[fut]}: {e}")
+
+            t_sig = time() - t1
+        else:
+            t_sig = 0.0
+
+        # Now compute minhash similarity cheaply
+        t2 = time()
+        scores = []
+        # we assume now every candidate has 'minhash_sig'
+        for idx, cand in enumerate(self._candidates):
+            sig = cand.get("minhash_sig")
+            if sig is None:
+                # fallback: extremely rare — treat as 0 similarity
+                sim = 0.0
+            else:
+                sim = minhash_similarity(base_sig, sig)
+            scores.append((idx, sim))
+        scores.sort(key=lambda t: t[1], reverse=True)
+        selected = [i for i, _ in scores[:max(1, shortlist_k)]]
+        t_score = time() - t2
+
+        # create base pickle for workers (as before)
+        fd, base_pth = tempfile.mkstemp(prefix="solcmp_base_", suffix=".pkl")
+        os.close(fd)
+        with open(base_pth, "wb") as f:
+            pickle.dump({"norm_lines": base_norm_lines, "orig_ranges": base_orig_ranges}, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        print(f"Base processed in {t_base:.2f}s, computed missing {len(missing_indices)} candidate sigs in {t_sig:.2f}s, scoring in {t_score:.2f}s, {len(selected)} candidates selected for detailed comparison")
+
+        # proceed to shortlist expensive diffs (same as before)
         if workers is None:
-            workers = os.cpu_count() or 4
+            workers = min(os.cpu_count() or 4, max(1, len(selected)))
 
-        candidate_count = len(self._candidates)
-        indices = list(range(candidate_count))
-        job_args = [(idx, base_norm_lines, base_nums, include_diff) for idx in indices]
-
+        job_args = [(i, include_diff) for i in selected]
         results = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_worker_initializer, initargs=(self._pickle_path,)) as ex:
-            futures = [ex.submit(_compare_candidate_worker, arg) for arg in job_args]
-            for fut in concurrent.futures.as_completed(futures, timeout=timeout):
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    res = {"candidate": None, "error": f"worker_exception: {e}"}
-                results.append(res)
 
-        # filter out errors
+        if self._pickle_path:
+            init_args = (self._pickle_path, base_pth)
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_worker_initializer, initargs=init_args) as ex:
+                for res in ex.map(_compare_candidate_worker, job_args, chunksize=self.chunksize):
+                    if res:
+                        results.append(res)
+        else:
+            # fallback local worker_local (as before)
+            local_candidates = self._candidates
+
+            def worker_local(arg):
+                idx, include_diff_flag = arg
+                cand = local_candidates[idx]
+                other_norm_lines = cand["norm_lines"]
+                other_orig_ranges = cand["orig_ranges"]
+                diff_info = diff_normalized_sequences_with_orig(base_norm_lines, base_orig_ranges, other_norm_lines, other_orig_ranges)
+                result = {
+                    "candidate": cand["path"],
+                    "total_changed_lines": diff_info["total_changed_lines"],
+                    "ranges": diff_info["ranges"],
+                    "num_norm_base_lines": len(base_norm_lines),
+                    "num_norm_other_lines": len(other_norm_lines)
+                }
+                if include_diff_flag:
+                    a_text = "\n".join(base_norm_lines)
+                    b_text = "\n".join(other_norm_lines)
+                    ud = list(difflib.unified_diff(a_text.splitlines(), b_text.splitlines(),
+                                                fromfile="base (normalized)",
+                                                tofile=Path(cand["path"]).name + " (normalized)",
+                                                lineterm=""))
+                    result["unified_diff_normalized"] = "\n".join(ud)
+                return result
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
+                for res in ex.map(worker_local, job_args, chunksize=self.chunksize):
+                    if res:
+                        results.append(res)
+
+        # cleanup base pickle
+        try:
+            Path(base_pth).unlink()
+        except Exception:
+            pass
+
         results = [r for r in results if r.get("candidate") is not None and "error" not in r]
-        # sort by least changed lines
         results.sort(key=lambda r: r["total_changed_lines"])
-
-        # apply max_allowed_changes threshold
-        if max_allowed_changes is not None:
-            if not results or results[0]["total_changed_lines"] > max_allowed_changes:
-                return []
-
+        total_time = time() - start_time
+        print(f"Total compare_with_base_src time: {total_time:.2f}s")
         return results[:top]
 
     def cleanup(self):
-        """Remove temporary pickle file (if any)."""
-        if self._pickle_path and Path(self._pickle_path).exists():
-            try:
-                Path(self._pickle_path).unlink()
-            except Exception:
-                pass
+        # no automatic removal of cache (cache preserved)
+        self._candidates = []
         self._pickle_path = None
 
     def __del__(self):
         self.cleanup()
 
-# ---------------------------------------------------------------------
-# If run as script: simple CLI
-# ---------------------------------------------------------------------
+# ----------------------------
+# CLI
+# ----------------------------
 if __name__ == "__main__":
     import argparse, pprint
-    from time import time
-    ap = argparse.ArgumentParser(description="SolidityComparator CLI")
-    ap.add_argument("--base", help="base solidity file")
-    ap.add_argument("--dir", help="directory with candidate .sol files")
+    ap = argparse.ArgumentParser(description="SolidityComparatorFastLoadOpt CLI")
+    ap.add_argument("--base", "-b", help="base solidity file", required=True)
+    ap.add_argument("--dir", "-d", help="directory with candidate .sol files", required=True)
     ap.add_argument("--recursive", "-r", action="store_true", help="search recursively")
     ap.add_argument("--top", type=int, default=1, help="top N matches")
     ap.add_argument("--workers", type=int, default=None, help="number of worker processes")
-    ap.add_argument("--diff", action="store_true", help="include normalized unified diff")
+    ap.add_argument("--shortlist", type=int, default=None, help="override shortlist_k")
+    ap.add_argument("--minhash", type=int, default=64, help="minhash signature size")
+    ap.add_argument("--chunksize", type=int, default=8, help="executor.map chunksize")
+    ap.add_argument("--no-cache", action="store_true", help="do not use on-disk cache (always rebuild)")
+    ap.add_argument("--build-cache", action="store_true", help="Only build candidate cache and exit")
     args = ap.parse_args()
 
-    sc = SolidityComparator()
-    start_time = time()
-    sc.load_candidates(args.dir, recursive=args.recursive, exclude_paths=[args.base])
-    load_time = time() - start_time
-    print(f"Loaded {len(sc._candidates)} candidates in {load_time:.2f} seconds.")
-    start_time = time()
-    res = sc.compare_with_base(args.base, top=args.top, workers=args.workers, include_diff=args.diff, max_allowed_changes=10)
-    comp_time = time() - start_time
-    print(f"Compared with base in {comp_time:.2f} seconds.")
-    pprint.pprint(res)
+    sc = SolidityComparatorFastLoadOpt(minhash_k=args.minhash, shortlist_k=(args.shortlist or 200), chunksize=args.chunksize)
+    t0 = time()
+    sc.load_candidates(args.dir, recursive=args.recursive, max_workers=args.workers, use_cache=(not args.no_cache), build_cache_only=args.build_cache)
+    if args.build_cache:
+        print("Cache build complete.")
+        exit(0)
 
-    start_time = time()
-    res = sc.compare_with_base("code.sol", top=args.top, workers=args.workers, include_diff=args.diff, max_allowed_changes=100)
-    comp_time = time() - start_time
-    print(f"Compared with base in {comp_time:.2f} seconds.")
+    t1 = time()
+    print(f"Loaded {len(sc._candidates)} candidates in {t1 - t0:.2f}s")
+    t2 = time()
+    res = sc.compare_with_base(args.base, top=args.top, workers=args.workers, shortlist_k=args.shortlist)
+    t3 = time()
+    print(f"Compared in {t3 - t2:.2f}s")
     pprint.pprint(res)
-    # sc.cleanup()

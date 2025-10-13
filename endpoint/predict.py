@@ -25,6 +25,9 @@ Follow these rules strictly:
 ### Important:
 There is only one vulnerability.
 Therefore, try to find one vulnerability if possible, or at most two.
+Look carefully at the code sections that are marked as "Vulnerability" in the comments. This is where the vulnerability is inserted.
+However, the vulnerability classification listed here is not necessarily accurate.
+Therefore, you should carefully consider and evaluate them.
 """
 
 VULN_PROMPT_TEMPLATE = textwrap.dedent("""
@@ -54,7 +57,7 @@ You are given Solidity source code and a comparison result highlighting changed 
 - Uninitialized Proxy / Delegatecall Risk
 - Weak Access Control
 
-### Required output schema (replace {response_format} with the JSON schema you expect)
+### Required output schema
 {response_format}
 
 If no vulnerability is found, output exactly:
@@ -242,15 +245,20 @@ def code_to_vulns(code: str, compare_result: Dict) -> PredictionResponse:
         print("No changes detected in the code compared to the base source.")
         return PredictionResponse(prediction=False, vulnerabilities=[])
     
-    try:
-        analysis = analyze_code_chutes(code, compare_result=compare_result)
-        # analysis = analyze_code_openai(code, compare_result=compare_result)
-        print(f"Analysis complete. Result:\n{analysis}")
+    max_attempts = 3
+    attempt = 0
+    while attempt < max_attempts:
+        try:
+            analysis = analyze_code_chutes(code, compare_result=compare_result)
+            # analysis = analyze_code_openai(code, compare_result=compare_result)
+            print(f"Analysis complete. Result:\n{analysis}")
 
-        if type(analysis) is not PredictionResponse:
-            raise ValueError("Analysis did not return a PredictionResponse object.")
+            if type(analysis) is not PredictionResponse:                
+                print(f"Analysis returned an error: {analysis}")
+                attempt += 1
+                continue
 
-        return analysis
-    except Exception as e:
-        print(f"[General Error] An error occurred during analysis: {e}")
-        raise
+            return analysis
+        except Exception as e:
+            print(f"[General Error] An error occurred during analysis: {e}")
+            attempt += 1
