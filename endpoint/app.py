@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from endpoint.predict import code_to_vulns
 from endpoint.solidity_comparator import SolidityComparatorFastLoadOpt
@@ -48,6 +48,9 @@ class _LRUCache:
             self._data.clear()
 
 class VulnerabilityAPI:
+    # Optional timeout for waiters (seconds). Set to None to wait indefinitely.
+    WAITER_TIMEOUT: Optional[float] = 30.0
+
     def __init__(self, lru_size: int = 1024, lru_ttl: float = 300.0):
         self.app = FastAPI()
         self._setup_routes()
@@ -83,18 +86,32 @@ class VulnerabilityAPI:
                 fut = self._in_progress.get(req_key)
                 if fut is None:
                     # Create a Future placeholder and register it
-                    fut = asyncio.get_running_loop().create_future()
+                    loop = asyncio.get_running_loop()
+                    fut = loop.create_future()
                     self._in_progress[req_key] = fut
                     is_starter = True
                 else:
                     is_starter = False
 
             if not is_starter:
-                # Another task is processing the same request; await its result
+                # Another task is processing the same request; await its result (with optional timeout)
                 try:
-                    result = await fut  # will raise if the starter set an exception
+                    if self.WAITER_TIMEOUT is not None:
+                        result = await asyncio.wait_for(fut, timeout=self.WAITER_TIMEOUT)
+                    else:
+                        result = await fut
+                except asyncio.TimeoutError:
+                    # Optionally remove stale in_progress entry if still the same future
+                    async with self._in_progress_lock:
+                        # only remove if the mapping still points to this future
+                        if self._in_progress.get(req_key) is fut:
+                            self._in_progress.pop(req_key, None)
+                    raise HTTPException(status_code=504, detail="Timed out waiting for result")
+                except asyncio.CancelledError:
+                    # Waiter cancelled — just propagate cancellation
+                    raise
                 except Exception as e:
-                    # If the starter errored, remove the future and propagate
+                    # The starter set an exception — remove in_progress and propagate
                     async with self._in_progress_lock:
                         self._in_progress.pop(req_key, None)
                     raise
@@ -105,10 +122,10 @@ class VulnerabilityAPI:
                 start_time = monotonic()
                 loop = asyncio.get_running_loop()
                 compare_results = None
+                # If you want to run heavy compare in executor, uncomment:
                 # compare_results = await loop.run_in_executor(
                 #     None, self.comparator.compare_with_base_src, code, 1, None, False, None, 100
                 # )
-                # handle compare_results possibly empty
                 compare_for_predict = compare_results[0] if compare_results else {}
                 # call code_to_vulns (assumed cheap); if expensive, also move to executor
                 result = await loop.run_in_executor(
@@ -118,20 +135,30 @@ class VulnerabilityAPI:
                 # store in cache
                 await self._result_cache.set(req_key, result)
 
-                # set the future result for waiters
-                fut.set_result(result)
+                # set the future result for waiters (if not already done)
+                if not fut.done():
+                    fut.set_result(result)
+
                 end_time = monotonic()
                 print(f"Processed request in {end_time - start_time:.2f} seconds")
                 return {"vulnerabilities": result}
             except Exception as exc:
-                # set exception for waiters
+                # set exception for waiters if not already set
                 if not fut.done():
                     fut.set_exception(exc)
                 raise
             finally:
-                # cleanup in_progress entry
+                # defensive: ensure waiters don't hang if something weird happened
+                if not fut.done():
+                    try:
+                        fut.set_exception(RuntimeError("Processing did not complete successfully"))
+                    except Exception:
+                        # ignore if fut was completed concurrently
+                        pass
                 async with self._in_progress_lock:
-                    self._in_progress.pop(req_key, None)
+                    # only remove if the mapping still points to this future
+                    if self._in_progress.get(req_key) is fut:
+                        self._in_progress.pop(req_key, None)
 
         @self.app.get("/health")
         async def health_check():

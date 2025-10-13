@@ -31,7 +31,14 @@ from typing import List, Tuple, Dict, Optional
 from time import time
 import hashlib
 from bitsec.utils.chutes_llm import chutes_client
-
+from endpoint.logger import logger
+# tqdm (progress bars) with safe fallback
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(it, *args, **kwargs):
+        return it
+    
 # MongoDB
 try:
     from pymongo import MongoClient
@@ -39,7 +46,7 @@ try:
     MONGO_AVAILABLE = True
 except ImportError:
     MONGO_AVAILABLE = False
-    print("Warning: pymongo not available. Install with: pip install pymongo")
+    logger.warning("Warning: pymongo not available. Install with: pip install pymongo")
 
 # ANN index: prefer faiss, fallback to sklearn
 FAISS_AVAILABLE = False
@@ -178,7 +185,20 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     """Embed a list of texts (strings). Returns list of vectors."""
     out = []
     for text in texts:
-        emb = chutes_client.embed(text)
+        max_attempts = 10
+        attempt = 0
+        base_delay = 1.0
+        while attempt < max_attempts:
+            try:
+                emb = chutes_client.embed(text)
+                break
+            except Exception as e:
+                attempt += 1
+                logger.warning(f"Embedding failed (attempt {attempt}/{max_attempts}): {e}")
+                delay = base_delay * (2 ** (attempt - 1))
+                time.sleep(delay)
+                if attempt == max_attempts:
+                    raise
         out.append(emb)
     return out
 
@@ -242,7 +262,7 @@ class ANNIndex:
             return res
 
 # ----------------------------
-# MongoDB Storage Manager
+# MongoDB Storage Manager (updated for incremental upserts & resume)
 # ----------------------------
 class MongoDBStorage:
     """Handles MongoDB operations for storing embeddings and metadata."""
@@ -256,58 +276,86 @@ class MongoDBStorage:
         self.collection = self.db[collection_name]
         
         # Create indexes for efficient queries
+        # path unique to allow per-file upsert/replace
         self.collection.create_index("path", unique=True)
         self.collection.create_index("snapshot_hash")
         self.collection.create_index([("mtime", 1), ("size", 1)])
-    
+
     def get_snapshot_hash(self, snapshot: List[Tuple[str, int, int]]) -> str:
         """Generate hash from file snapshot."""
         return hashlib.sha1(json.dumps(snapshot).encode()).hexdigest()
-    
+
     def check_cache_valid(self, snapshot_hash: str) -> bool:
-        """Check if cached data exists for this snapshot."""
+        """Check if cached data exists for this snapshot (at least one doc)."""
         count = self.collection.count_documents({"snapshot_hash": snapshot_hash})
         return count > 0
-    
+
     def load_candidates(self, snapshot_hash: str) -> List[Dict]:
         """Load candidates from MongoDB."""
         cursor = self.collection.find({"snapshot_hash": snapshot_hash})
         candidates = []
         for doc in cursor:
-            # Convert MongoDB document to candidate format
             candidate = {
                 "path": doc["path"],
                 "norm_lines": doc["norm_lines"],
-                "orig_ranges": [tuple(r) for r in doc["orig_ranges"]],  # Convert back to tuples
-                "embedding": doc["embedding"]
+                "orig_ranges": [tuple(r) for r in doc["orig_ranges"]],
+                "embedding": doc.get("embedding")
             }
             candidates.append(candidate)
         return candidates
-    
-    def save_candidates(self, candidates: List[Dict], snapshot_hash: str):
-        """Save candidates to MongoDB."""
-        # Clear old entries with this snapshot hash
-        self.collection.delete_many({"snapshot_hash": snapshot_hash})
-        
-        # Prepare documents for insertion
-        docs = []
+
+    def get_saved_paths_for_snapshot(self, snapshot_hash: str) -> set:
+        """Return set of file paths already stored for this snapshot."""
+        cursor = self.collection.find({"snapshot_hash": snapshot_hash}, {"path": 1})
+        return {doc["path"] for doc in cursor}
+
+    def save_candidates_batch_upsert(self, candidates: List[Dict], snapshot_hash: str):
+        """Upsert a batch of candidate documents into MongoDB (idempotent)."""
+        if not candidates:
+            return
+        # Use bulk write with upsert for idempotence
+        from pymongo import UpdateOne
+        ops = []
         for candidate in candidates:
             doc = {
                 "path": candidate["path"],
                 "snapshot_hash": snapshot_hash,
                 "norm_lines": candidate["norm_lines"],
-                "orig_ranges": candidate["orig_ranges"],  # Store as list of lists
-                "embedding": candidate["embedding"]
+                "orig_ranges": candidate["orig_ranges"],
+                "embedding": candidate.get("embedding"),
+                # optionally store mtime/size if present
             }
-            docs.append(doc)
-        
-        # Bulk insert
-        if docs:
-            self.collection.insert_many(docs)
-    
+            ops.append(UpdateOne({"path": doc["path"]}, {"$set": doc}, upsert=True))
+        # perform in reasonable chunk sizes to avoid huge operation lists
+        if ops:
+            B = 500
+            for i in range(0, len(ops), B):
+                batch_ops = ops[i:i+B]
+                self.collection.bulk_write(batch_ops, ordered=False)
+
     def close(self):
         """Close MongoDB connection."""
         self.client.close()
+
+    def count_documents_for_snapshot(self, snapshot_hash: str) -> int:
+        """Return total documents for snapshot (any doc)."""
+        return self.collection.count_documents({"snapshot_hash": snapshot_hash})
+
+    def count_embedded_for_snapshot(self, snapshot_hash: str) -> int:
+        """Return number of documents that have a non-null embedding for this snapshot."""
+        return self.collection.count_documents({"snapshot_hash": snapshot_hash, "embedding": {"$ne": None}})
+
+    def get_paths_without_embedding(self, snapshot_hash: str, limit: Optional[int] = None) -> List[str]:
+        """Return list of paths that lack an embedding (useful for re-embedding)."""
+        q = {"snapshot_hash": snapshot_hash, "$or": [{"embedding": {"$exists": False}}, {"embedding": None}]}
+        cursor = self.collection.find(q, {"path": 1})
+        if limit:
+            cursor = cursor.limit(limit)
+        return [d["path"] for d in cursor]
+
+    def get_sample_missing_paths(self, snapshot_hash: str, sample_n: int = 20) -> List[str]:
+        """Return a small sample of missing paths for quick inspection."""
+        return self.get_paths_without_embedding(snapshot_hash, limit=sample_n)
 
 # ----------------------------
 # Worker functions for parallel processing
@@ -396,100 +444,229 @@ class SolidityComparatorEmbeddings:
         self._embeddings_index: Optional[ANNIndex] = None
         self._embeddings_vectors: Optional[List[List[float]]] = None
 
+    # ----------------------------
+    # load_candidates (modified to persist per-batch and support resume)
+    # ----------------------------
     def load_candidates(self, directory: str, recursive: bool = False, use_cache: bool = True, workers: int = 8):
         """
         Load candidates + compute & cache per-file embeddings (document-level) using MongoDB.
-        Each candidate entry will be: {path, norm_lines, orig_ranges, embedding}
+        Now writes embeddings incrementally and supports resuming.
         """
         directory = Path(directory)
         if not directory.is_dir():
             raise FileNotFoundError(directory)
 
-        # <CHANGE> Build snapshot and check MongoDB cache
-        snapshot = []
+        # build snapshot
         files = list(directory.rglob("*.sol")) if recursive else list(directory.glob("*.sol"))
         files = [p for p in files if p.is_file()]
         files.sort()
+        snapshot = []
         for p in files:
             st = p.stat()
             snapshot.append((str(p.resolve()), int(st.st_mtime), st.st_size))
-        
         snapshot_hash = self.mongo_storage.get_snapshot_hash(snapshot)
 
-        # Check MongoDB cache
+        # If fully cached and use_cache -> load from DB and build index
         if use_cache and self.mongo_storage.check_cache_valid(snapshot_hash):
-            print(f"Loading candidates from MongoDB cache (snapshot: {snapshot_hash[:8]}...)")
+            logger.info(f"Loading candidates from MongoDB cache (snapshot: {snapshot_hash[:8]}...)")
             self._candidates = self.mongo_storage.load_candidates(snapshot_hash)
-            
-            # Build index from cached embeddings
-            self._embeddings_vectors = [c["embedding"] for c in self._candidates if "embedding" in c]
-            ids = [i for i, c in enumerate(self._candidates) if "embedding" in c]
+            self._embeddings_vectors = [c["embedding"] for c in self._candidates if c.get("embedding") is not None]
+            ids = [i for i, c in enumerate(self._candidates) if c.get("embedding") is not None]
             if self._embeddings_vectors:
                 dim = len(self._embeddings_vectors[0])
                 self._embeddings_index = ANNIndex(dim, method=self.index_method)
                 self._embeddings_index.build(self._embeddings_vectors, ids)
-            print(f"Loaded {len(self._candidates)} candidates from MongoDB")
+            logger.info(f"Loaded {len(self._candidates)} candidates from MongoDB")
             return
 
-        # <CHANGE> Process files and compute embeddings
-        print(f"Processing {len(files)} Solidity files...")
-        
+        # Otherwise, we will (re)compute embeddings, but skip those already saved for this snapshot.
+        logger.info(f"Processing {len(files)} Solidity files (snapshot {snapshot_hash[:8]}...), resume enabled")
+
+        # Determine which paths are already saved (resume)
+        saved_paths = self.mongo_storage.get_saved_paths_for_snapshot(snapshot_hash) if use_cache else set()
+        if saved_paths:
+            logger.info(f"Resuming: {len(saved_paths)} files already in DB for this snapshot")
+
+        # Prepare list of to-do files (full resolved path strings)
+        todo_paths = [p for p in files if str(p.resolve()) not in saved_paths]
+        logger.info(f"{len(todo_paths)} files to process (skipping {len(files) - len(todo_paths)} saved)")
+
+        # helper to read+normalize a single file (threadsafe)
         def process_read(path: Path):
             try:
                 src = path.read_text(encoding="utf-8")
             except Exception as e:
-                print(f"Error reading {path}: {e}")
+                logger.error(f"Error reading {path}: {e}")
                 return None
             lines_with_orig = strip_comments_preserve_lines_with_orig(src)
             norm_lines, orig_ranges = build_normalized_sequence_with_orig(lines_with_orig)
             doc_text = "\n".join(norm_lines)
             return {
-                "path": str(path.resolve()), 
-                "norm_lines": norm_lines, 
-                "orig_ranges": orig_ranges, 
+                "path": str(path.resolve()),
+                "norm_lines": norm_lines,
+                "orig_ranges": orig_ranges,
                 "doc_text": doc_text
             }
 
-        # Run reads in parallel
+        # Read and normalize all todo files using a thread pool (we keep entries in memory per batch)
         entries = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, workers*2)) as ex:
-            for res in ex.map(process_read, files, chunksize=32):
+            for res in tqdm(ex.map(process_read, [Path(p) for p in todo_paths], chunksize=32),
+                            total=len(todo_paths), desc="Reading files"):
                 if res:
                     entries.append(res)
 
-        print(f"Computing embeddings for {len(entries)} files...")
-        
-        # Compute embeddings in batches
-        doc_texts = [e["doc_text"] for e in entries]
-        embeddings = []
-        B = self.embed_batch_size
-        for i in range(0, len(doc_texts), B):
-            batch = doc_texts[i:i+B]
-            embs = embed_texts(batch)
-            embeddings.extend(embs)
-            if (i + B) % (B * 10) == 0:
-                print(f"  Embedded {min(i + B, len(doc_texts))}/{len(doc_texts)} files")
-        
-        # Attach embeddings and clean up
-        for e, emb in zip(entries, embeddings):
-            e["embedding"] = emb
-            e.pop("doc_text", None)
-        
-        self._candidates = entries
+        logger.info(f"Computed normalized text for {len(entries)} files; now embedding & upserting in batches")
 
-        # Build ANN index
-        if entries and entries[0].get("embedding") is not None:
-            dim = len(entries[0]["embedding"])
-            self._embeddings_vectors = [c["embedding"] for c in self._candidates]
-            ids = list(range(len(self._candidates)))
+        # Embed and upsert incrementally in batches
+        B = self.embed_batch_size or 64
+        for i in range(0, len(entries), B):
+            batch = entries[i:i+B]
+            docs_texts = [e["doc_text"] for e in batch]
+            # compute embeddings (with retries inside embed_texts)
+            embs = embed_texts(docs_texts)
+            # attach embeddings and prepare docs for upsert
+            docs_for_db = []
+            for e, emb in zip(batch, embs):
+                e["embedding"] = emb
+                # remove doc_text payload to avoid storing it
+                e.pop("doc_text", None)
+                # ensure orig_ranges are serializable lists (they already are)
+                docs_for_db.append({
+                    "path": e["path"],
+                    "norm_lines": e["norm_lines"],
+                    "orig_ranges": e["orig_ranges"],
+                    "embedding": e["embedding"]
+                })
+            # upsert the batch to MongoDB (idempotent)
+            try:
+                self.mongo_storage.save_candidates_batch_upsert(docs_for_db, snapshot_hash)
+                logger.info(f"  Upserted {min(i+B, len(entries))}/{len(entries)} embeddings to MongoDB")
+            except Exception as ex:
+                logger.exception(f"Failed to upsert batch starting at {i}: {ex}")
+                # on failure we continue (so partial progress remains), but you may want to raise
+
+        # Now load the full set of candidates for this snapshot from DB (this includes previously saved + newly saved)
+        self._candidates = self.mongo_storage.load_candidates(snapshot_hash)
+        # Build ANN index from embeddings present (skip docs without embeddings)
+        self._embeddings_vectors = [c["embedding"] for c in self._candidates if c.get("embedding") is not None]
+        ids = [i for i, c in enumerate(self._candidates) if c.get("embedding") is not None]
+        if self._embeddings_vectors:
+            dim = len(self._embeddings_vectors[0])
             self._embeddings_index = ANNIndex(dim, method=self.index_method)
             self._embeddings_index.build(self._embeddings_vectors, ids)
 
-        # <CHANGE> Save to MongoDB instead of pickle
-        print(f"Saving {len(entries)} candidates to MongoDB...")
-        self.mongo_storage.save_candidates(self._candidates, snapshot_hash)
-        print("Candidates saved to MongoDB")
+        logger.info(f"Finished loading candidates: total documents for snapshot = {len(self._candidates)}")
 
+
+    def reembed_failed_docs(self, snapshot_hash: str, reembed_batch_size: int = None, workers: int = 4, embed_batch_size: Optional[int] = None):
+        """
+        Re-embed documents for a given snapshot that are missing embeddings, and upsert results.
+        - snapshot_hash: snapshot id to target
+        - reembed_batch_size: number of file-documents to batch read+embed per DB upsert step
+        - workers: threadpool workers for reading files
+        - embed_batch_size: embedding batch size (defaults to self.embed_batch_size)
+        Returns a dict with counts and errors (if any).
+        """
+        if reembed_batch_size is None:
+            reembed_batch_size = embed_batch_size or self.embed_batch_size or 64
+        if embed_batch_size is None:
+            embed_batch_size = self.embed_batch_size or 64
+
+        missing_paths = self.mongo_storage.get_paths_without_embedding(snapshot_hash)
+        if not missing_paths:
+            return {"skipped": 0, "reembedded": 0, "errors": []}
+
+        logger.info(f"Re-embedding {len(missing_paths)} documents for snapshot {snapshot_hash[:8]}...")
+
+        # Helper to read & normalize a list of paths (threadpool friendly)
+        def read_and_normalize(path_str: str):
+            p = Path(path_str)
+            try:
+                src = p.read_text(encoding="utf-8")
+            except Exception as e:
+                logger.error(f"Error reading {p}: {e}")
+                return None
+            lines_with_orig = strip_comments_preserve_lines_with_orig(src)
+            norm_lines, orig_ranges = build_normalized_sequence_with_orig(lines_with_orig)
+            doc_text = "\n".join(norm_lines)
+            return {"path": str(p.resolve()), "norm_lines": norm_lines, "orig_ranges": orig_ranges, "doc_text": doc_text}
+
+        reembedded = 0
+        errors = []
+
+        # read files in parallel in chunks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, workers*2)) as ex:
+            it = ex.map(read_and_normalize, missing_paths, chunksize=16)
+            pending_entries = []
+            for entry in tqdm(it, total=len(missing_paths), desc="Reading missing files"):
+                if entry is None:
+                    errors.append("read_error")
+                    continue
+                pending_entries.append(entry)
+                # when pending reaches reembed_batch_size, compute embeddings and upsert
+                if len(pending_entries) >= reembed_batch_size:
+                    docs_for_db, re_count, errs = self._embed_and_upsert_entries(pending_entries, embed_batch_size)
+                    reembedded += re_count
+                    errors.extend(errs)
+                    pending_entries = []
+
+            # handle any remaining
+            if pending_entries:
+                docs_for_db, re_count, errs = self._embed_and_upsert_entries(pending_entries, embed_batch_size)
+                reembedded += re_count
+                errors.extend(errs)
+
+        # After re-embedding, optionally refresh in-memory candidates/index
+        # Re-load candidates for this snapshot (so in-memory view is consistent)
+        self._candidates = self.mongo_storage.load_candidates(snapshot_hash)
+        self._embeddings_vectors = [c["embedding"] for c in self._candidates if c.get("embedding") is not None]
+        ids = [i for i, c in enumerate(self._candidates) if c.get("embedding") is not None]
+        if self._embeddings_vectors:
+            dim = len(self._embeddings_vectors[0])
+            self._embeddings_index = ANNIndex(dim, method=self.index_method)
+            self._embeddings_index.build(self._embeddings_vectors, ids)
+
+        return {"skipped": 0, "reembedded": reembedded, "errors": errors}
+
+    def _embed_and_upsert_entries(self, entries: List[Dict], embed_batch_size: int):
+        """
+        Helper that takes a list of entries (each has doc_text) -> computes embeddings in batches,
+        upserts them using mongo_storage.save_candidates_batch_upsert, and returns summary.
+        Returns (docs_for_db, reembedded_count, errors_list)
+        """
+        docs_for_db = []
+        errors = []
+        reembedded = 0
+        B = embed_batch_size or self.embed_batch_size or 64
+        for i in range(0, len(entries), B):
+            batch = entries[i:i+B]
+            texts = [e["doc_text"] for e in batch]
+            try:
+                embs = embed_texts(texts)
+            except Exception as ex:
+                logger.exception(f"Embedding batch failed: {ex}")
+                # record error and skip this batch (you can choose to raise instead)
+                errors.append(str(ex))
+                continue
+            for e, emb in zip(batch, embs):
+                e["embedding"] = emb
+                e.pop("doc_text", None)
+                docs_for_db.append({
+                    "path": e["path"],
+                    "norm_lines": e["norm_lines"],
+                    "orig_ranges": e["orig_ranges"],
+                    "embedding": e["embedding"]
+                })
+            # upsert this batch
+            try:
+                self.mongo_storage.save_candidates_batch_upsert(docs_for_db[-len(batch):], snapshot_hash=None)  # note: snapshot_hash will be set in save function; we'll set below
+                reembedded += len(batch)
+            except Exception as ex:
+                logger.exception(f"Failed to upsert re-embedded batch: {ex}")
+                errors.append(str(ex))
+        return docs_for_db, reembedded, errors
+    
     def compare_with_base(self, base_path: str, top: int = 1, workers: Optional[int] = None, 
                          include_diff: bool = False, shortlist_k: Optional[int] = None) -> List[Dict]:
         """Compare base file with candidates using embedding-based retrieval."""
@@ -529,7 +706,7 @@ class SolidityComparatorEmbeddings:
             if len(selected) >= shortlist_k:
                 break
 
-        print(f"Selected {len(selected)} candidates from embedding search, running detailed diffs...")
+        logger.info(f"Selected {len(selected)} candidates from embedding search, running detailed diffs...")
 
         # <CHANGE> Fixed parallel processing with proper worker initialization
         # Create temporary pickle files for worker processes
@@ -553,12 +730,14 @@ class SolidityComparatorEmbeddings:
         job_args = [(i, include_diff) for i in selected]
         results = []
         
+        # Use tqdm to show progress for detailed diffs
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=workers,
             initializer=_worker_initializer,
             initargs=(candidates_pickle_path, base_pickle_path)
         ) as ex:
-            for res in ex.map(_compare_candidate_worker, job_args, chunksize=4):
+            # ex.map is an iterator; wrap it in tqdm with known total
+            for res in tqdm(ex.map(_compare_candidate_worker, job_args, chunksize=4), total=len(job_args), desc="Detailed diffs"):
                 if res and "error" not in res:
                     results.append(res)
 
@@ -567,7 +746,7 @@ class SolidityComparatorEmbeddings:
             Path(base_pickle_path).unlink()
             Path(candidates_pickle_path).unlink()
         except Exception as e:
-            print(f"Warning: Could not delete temp files: {e}")
+            logger.warning(f"Warning: Could not delete temp files: {e}")
 
         # Sort by similarity (fewer changed lines = more similar)
         results.sort(key=lambda r: r["total_changed_lines"])
@@ -581,36 +760,138 @@ class SolidityComparatorEmbeddings:
 # Example usage
 # ----------------------------
 if __name__ == "__main__":
-    # Example: Create comparator with MongoDB backend
-    comparator = SolidityComparatorEmbeddings(
-        index_method="faiss",  # or "sklearn"
-        shortlist_k=200,
-        mongo_uri="mongodb://localhost:27017",
-        mongo_db="solidity_embeddings",
-        mongo_collection="candidates"
-    )
-    
-    # Load candidates from directory
-    comparator.load_candidates(
-        "samples/clean-codebases",
-        recursive=True,
-        use_cache=True,
-        workers=8
-    )
-    
-    # Compare with base file
-    results = comparator.compare_with_base(
-        "code1.sol",
-        top=1,
-        workers=4,
-        include_diff=True
-    )
-    
-    # Print results
-    for i, result in enumerate(results, 1):
-        print(f"\n{i}. {result['candidate']}")
-        print(f"   Changed lines: {result['total_changed_lines']}")
-        print(f"   Base lines: {result['num_norm_base_lines']}, Other lines: {result['num_norm_other_lines']}")
-    
-    # Close MongoDB connection
-    comparator.close()
+    import argparse
+    from fastapi import FastAPI
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="SolidityComparatorEmbeddings CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # load subcommand
+    p_load = sub.add_parser("load", help="Load candidates (with incremental upsert/resume).")
+    p_load.add_argument("--dir", required=True, help="Directory containing .sol files")
+    p_load.add_argument("--recursive", action="store_true")
+    p_load.add_argument("--workers", type=int, default=8)
+    p_load.add_argument("--embed-batch-size", type=int, default=64)
+    p_load.add_argument("--index-method", choices=["faiss", "sklearn"], default="faiss")
+    p_load.add_argument("--mongo-uri", default="mongodb://localhost:27017")
+    p_load.add_argument("--mongo-db", default="solidity_embeddings")
+    p_load.add_argument("--mongo-collection", default="candidates")
+    p_load.add_argument("--resume", action="store_true", help="Resume using existing DB snapshot if present")
+
+    # status subcommand (CLI status print)
+    p_status = sub.add_parser("status", help="Print snapshot status for a directory or a snapshot_hash")
+    p_status.add_argument("--dir", help="Directory to compute snapshot hash and show progress")
+    p_status.add_argument("--snapshot-hash", help="Snapshot hash to inspect (if given, --dir is ignored)")
+    p_status.add_argument("--mongo-uri", default="mongodb://localhost:27017")
+    p_status.add_argument("--mongo-db", default="solidity_embeddings")
+    p_status.add_argument("--mongo-collection", default="candidates")
+    p_status.add_argument("--sample-missing", type=int, default=10, help="Return sample missing paths")
+
+    # reembed-failed subcommand
+    p_reembed = sub.add_parser("reembed-failed", help="Re-embed documents that lack embeddings for a snapshot")
+    p_reembed.add_argument("--snapshot-hash", required=True)
+    p_reembed.add_argument("--mongo-uri", default="mongodb://localhost:27017")
+    p_reembed.add_argument("--mongo-db", default="solidity_embeddings")
+    p_reembed.add_argument("--mongo-collection", default="candidates")
+    p_reembed.add_argument("--workers", type=int, default=4)
+    p_reembed.add_argument("--embed-batch-size", type=int, default=64)
+
+    # status server (FastAPI)
+    p_server = sub.add_parser("serve-status", help="Run a status HTTP server (FastAPI) to inspect snapshots")
+    p_server.add_argument("--host", default="0.0.0.0")
+    p_server.add_argument("--port", type=int, default=5000)
+    p_server.add_argument("--mongo-uri", default="mongodb://localhost:27017")
+    p_server.add_argument("--mongo-db", default="solidity_embeddings")
+    p_server.add_argument("--mongo-collection", default="candidates")
+
+    args = parser.parse_args()
+
+    if args.cmd == "load":
+        comp = SolidityComparatorEmbeddings(
+            index_method=args.index_method,
+            shortlist_k=200,
+            embed_batch_size=args.embed_batch_size,
+            mongo_uri=args.mongo_uri,
+            mongo_db=args.mongo_db,
+            mongo_collection=args.mongo_collection
+        )
+        # call load_candidates; use_cache True will resume using DB entries for the snapshot
+        comp.load_candidates(args.dir, recursive=args.recursive, use_cache=args.resume, workers=args.workers)
+        logger.info("Load finished.")
+        comp.close()
+
+    elif args.cmd == "status":
+        storage = MongoDBStorage(args.mongo_uri, args.mongo_db, args.mongo_collection)
+        if args.dir:
+            # compute snapshot for directory
+            d = Path(args.dir)
+            files = list(d.rglob("*.sol")) if args.dir and d.exists() and d.is_dir() else []
+            files = [p for p in files if p.is_file()]
+            snapshot = []
+            for p in files:
+                st = p.stat()
+                snapshot.append((str(p.resolve()), int(st.st_mtime), st.st_size))
+            snapshot_hash = storage.get_snapshot_hash(snapshot)
+            logger.info(f"Snapshot hash: {snapshot_hash}")
+        else:
+            if not args.snapshot_hash:
+                logger.error("Provide --dir or --snapshot-hash")
+                raise SystemExit(1)
+            snapshot_hash = args.snapshot_hash
+
+        total = storage.count_documents_for_snapshot(snapshot_hash)
+        embedded = storage.count_embedded_for_snapshot(snapshot_hash)
+        missing = total - embedded
+        sample_missing = storage.get_sample_missing_paths(snapshot_hash, sample_n=args.sample_missing)
+        out = {"snapshot_hash": snapshot_hash, "total_docs": total, "embedded": embedded, "missing": missing, "sample_missing": sample_missing}
+        logger.info(json.dumps(out, indent=2))
+
+    elif args.cmd == "reembed-failed":
+        comp = SolidityComparatorEmbeddings(
+            index_method="faiss",
+            shortlist_k=200,
+            embed_batch_size=args.embed_batch_size,
+            mongo_uri=args.mongo_uri,
+            mongo_db=args.mongo_db,
+            mongo_collection=args.mongo_collection
+        )
+        res = comp.reembed_failed_docs(args.snapshot_hash, reembed_batch_size=args.embed_batch_size, workers=args.workers, embed_batch_size=args.embed_batch_size)
+        logger.info(json.dumps(res, indent=2))
+        comp.close()
+
+    elif args.cmd == "serve-status":
+        storage = MongoDBStorage(args.mongo_uri, args.mongo_db, args.mongo_collection)
+        status_app = FastAPI()
+
+        @status_app.get("/status")
+        def status(snapshot_hash: str, sample_missing: int = 10):
+            total = storage.count_documents_for_snapshot(snapshot_hash)
+            embedded = storage.count_embedded_for_snapshot(snapshot_hash)
+            missing = total - embedded
+            sample = storage.get_sample_missing_paths(snapshot_hash, sample_n=sample_missing)
+            return {"snapshot_hash": snapshot_hash, "total_docs": total, "embedded": embedded, "missing": missing, "sample_missing": sample}
+
+        @status_app.get("/status_by_dir")
+        def status_by_dir(dir: str, sample_missing: int = 10):
+            d = Path(dir)
+            if not d.exists() or not d.is_dir():
+                return {"error": "dir not found", "dir": dir}
+            files = list(d.rglob("*.sol"))
+            files = [p for p in files if p.is_file()]
+            snapshot = []
+            for p in files:
+                st = p.stat()
+                snapshot.append((str(p.resolve()), int(st.st_mtime), st.st_size))
+            snapshot_hash = storage.get_snapshot_hash(snapshot)
+            total = storage.count_documents_for_snapshot(snapshot_hash)
+            embedded = storage.count_embedded_for_snapshot(snapshot_hash)
+            missing = total - embedded
+            sample = storage.get_sample_missing_paths(snapshot_hash, sample_n=sample_missing)
+            return {"snapshot_hash": snapshot_hash, "total_docs": total, "embedded": embedded, "missing": missing, "sample_missing": sample}
+
+        logger.info(f"Starting status server on {args.host}:{args.port} ...")
+        uvicorn.run(status_app, host=args.host, port=args.port)
+
+    else:
+        parser.print_help()
