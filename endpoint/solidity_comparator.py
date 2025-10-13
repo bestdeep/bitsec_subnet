@@ -99,6 +99,88 @@ def strip_comments_preserve_lines(source: str) -> List[Tuple[int, str]]:
         result_lines.append((lineno, "".join(cur_chars)))
     return result_lines
 
+def strip_comments_preserve_lines_with_orig(source: str) -> List[Tuple[List[int], str]]:
+    """
+    Returns a list of tuples: (original_line_numbers, text_after_removing_comments)
+    original_line_numbers: list of line numbers in the original file corresponding to this line
+    """
+    result_lines: List[Tuple[List[int], str]] = []
+    i = 0
+    n = len(source)
+    lineno = 1
+    cur_chars: List[str] = []
+    cur_orig_lines: List[int] = []
+
+    in_block = False
+    in_string = False
+    string_delim = None
+
+    while i < n:
+        ch = source[i]
+        cur_orig_lines.append(lineno)
+
+        # Handle block comment
+        if in_block:
+            if ch == '*' and i + 1 < n and source[i+1] == '/':
+                in_block = False
+                i += 2
+                continue
+            if ch == '\n':
+                # Append empty string for commented lines
+                result_lines.append((cur_orig_lines.copy(), "".join(cur_chars)))
+                cur_chars = []
+                cur_orig_lines = []
+                lineno += 1
+            i += 1
+            continue
+
+        # Handle string literals
+        if in_string:
+            if ch == '\\' and i + 1 < n:
+                cur_chars.append(ch); cur_chars.append(source[i+1]); i += 2; continue
+            if ch == string_delim:
+                cur_chars.append(ch); in_string = False; string_delim = None; i += 1; continue
+            if ch == '\n':
+                result_lines.append((cur_orig_lines.copy(), "".join(cur_chars)))
+                cur_chars = []
+                cur_orig_lines = []
+                lineno += 1
+                i += 1
+                continue
+            cur_chars.append(ch); i += 1; continue
+
+        # Start string
+        if ch == '"' or ch == "'":
+            in_string = True; string_delim = ch; cur_chars.append(ch); i += 1; continue
+
+        # Start block comment
+        if ch == '/' and i + 1 < n and source[i+1] == '*':
+            in_block = True; i += 2; continue
+
+        # Single-line comment
+        if ch == '/' and i + 1 < n and source[i+1] == '/':
+            i += 2
+            while i < n and source[i] not in '\n\r':
+                i += 1
+            continue
+
+        if ch == '\r':
+            i += 1; continue
+
+        if ch == '\n':
+            result_lines.append((cur_orig_lines.copy(), "".join(cur_chars)))
+            cur_chars = []
+            cur_orig_lines = []
+            lineno += 1
+            i += 1
+            continue
+
+        cur_chars.append(ch)
+        i += 1
+
+    if cur_chars or lineno == 1:
+        result_lines.append((cur_orig_lines.copy(), "".join(cur_chars)))
+    return result_lines
 
 _PUNCT = r"\{\}\(\)\[\]\.,;:+\-*/%=\<\>!&\|^~\?:"
 _PUNCT_RE_BEFORE = re.compile(rf"\s+([{re.escape(_PUNCT)}])")
@@ -122,6 +204,22 @@ def build_normalized_sequence(lines_with_numbers: List[Tuple[int, str]]) -> Tupl
         norm_lines.append(n)
         orig_nums.append(lineno)
     return norm_lines, orig_nums
+
+def build_normalized_sequence_with_orig(lines_with_orig: List[Tuple[List[int], str]]) -> Tuple[List[str], List[Tuple[int,int]]]:
+    """
+    Returns:
+       - normalized lines
+       - original line ranges: list of tuples (start_line, end_line) in original file
+    """
+    norm_lines: List[str] = []
+    orig_ranges: List[Tuple[int,int]] = []
+    for orig_lines, raw in lines_with_orig:
+        n = normalize_line(raw)
+        if n == "":
+            continue
+        norm_lines.append(n)
+        orig_ranges.append((orig_lines[0], orig_lines[-1]))  # first and last original line numbers
+    return norm_lines, orig_ranges
 
 def diff_normalized_sequences(base_lines: List[str], base_nums: List[int],
                               other_lines: List[str], other_nums: List[int]) -> Dict:
@@ -167,6 +265,33 @@ def diff_normalized_sequences(base_lines: List[str], base_nums: List[int],
         "total_changed_lines": total_changed
     }
 
+def diff_normalized_sequences_with_orig(base_lines, base_orig_ranges, other_lines, other_orig_ranges):
+    sm = difflib.SequenceMatcher(a=base_lines, b=other_lines, autojunk=False)
+    ranges = []
+    total_changed = 0
+
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        base_range = base_orig_ranges[a1:a2]
+        other_range = other_orig_ranges[b1:b2]
+
+        # Merge line ranges into single tuple (start, end)
+        base_ln = (base_range[0][0], base_range[-1][1]) if base_range else None
+        other_ln = (other_range[0][0], other_range[-1][1]) if other_range else None
+
+        total_changed += (a2 - a1) + (b2 - b1)
+
+        ranges.append({
+            "tag": tag,
+            "base_line_range": base_ln,
+            "other_line_range": other_ln,
+            "base_snippet": "\n".join(base_lines[a1:a2]),
+            "other_snippet": "\n".join(other_lines[b1:b2])
+        })
+
+    return {"ranges": ranges, "total_changed_lines": total_changed}
+
 # ---------------------------------------------------------------------
 # Worker-global variable(s) loaded by initializer
 # ---------------------------------------------------------------------
@@ -204,7 +329,7 @@ def _compare_candidate_worker(idx_and_base, include_diff: bool=False):
     other_norm_lines = cand["norm_lines"]
     other_nums = cand["orig_nums"]
 
-    diff_info = diff_normalized_sequences(base_norm_lines, base_nums, other_norm_lines, other_nums)
+    diff_info = diff_normalized_sequences_with_orig(base_norm_lines, base_nums, other_norm_lines, other_nums)
     result = {
         "candidate": cand_path,
         "total_changed_lines": diff_info["total_changed_lines"],
@@ -289,7 +414,7 @@ class SolidityComparator:
         self._pickle_path = ppath
 
     def compare_with_base(self, base_path: str, top: int=1, workers: Optional[int]=None,
-                          include_diff: bool=False, timeout: Optional[float]=None) -> List[Dict]:
+                          include_diff: bool=False, timeout: Optional[float]=None, max_allowed_changes=10) -> List[Dict]:
         """
         Compare base_path to loaded candidates in parallel.
 
@@ -307,30 +432,37 @@ class SolidityComparator:
 
         # parse base once in main process
         base_src = base_path.read_text(encoding="utf-8")
+
+        return self.compare_with_base_src(base_src, top=top, workers=workers, include_diff=include_diff, timeout=timeout, max_allowed_changes=max_allowed_changes)
+
+    def compare_with_base_src(self, base_src: str, top: int=1, workers: Optional[int]=None,
+                              include_diff: bool=False, timeout: Optional[float]=None,
+                              max_allowed_changes: Optional[int]=None) -> List[Dict]:
+        """
+        Compare base_src to loaded candidates in parallel.
+
+        - top: how many top matches to return (sorted by least total_changed_lines).
+        - workers: number of worker processes (default = cpu_count()).
+        - include_diff: whether to include unified diff of normalized content.
+        - timeout: optional overall timeout in seconds for the entire operation (None means no timeout).
+        - max_allowed_changes: if set, any candidate with more total_changed_lines than this will be ignored.
+        """
+        if not self._candidates or not self._pickle_path:
+            raise RuntimeError("Candidates not loaded. Call load_candidates() first.")
+
         base_lines_with_numbers = strip_comments_preserve_lines(base_src)
         base_norm_lines, base_nums = build_normalized_sequence(base_lines_with_numbers)
 
-        # Prepare worker pool
         if workers is None:
             workers = os.cpu_count() or 4
 
-        # Create a ProcessPoolExecutor with initializer that loads the candidate pickle once per worker
-        # We'll pass to each worker only the candidate index and the base_norm/base_nums (to avoid pickling full candidates for each job)
         candidate_count = len(self._candidates)
         indices = list(range(candidate_count))
-
-        # Prepare inputs as tuples: (candidate_index, base_norm_lines, base_nums, include_diff)
-        # Note: base_norm_lines/base_nums are pickled and sent to each worker per job; to avoid repeated pickling,
-        # we submit one job per candidate, which still requires pickling base_norm_lines once per job.
-        # For a very large base, we could also pickle base into a temp file and have worker initializer load it once.
-        # For most practical bases this cost is acceptable. If you want base loaded once per worker too, tell me and I will adjust.
         job_args = [(idx, base_norm_lines, base_nums, include_diff) for idx in indices]
 
         results = []
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_worker_initializer, initargs=(self._pickle_path,)) as ex:
-            # submit all jobs
             futures = [ex.submit(_compare_candidate_worker, arg) for arg in job_args]
-            # collect as they finish
             for fut in concurrent.futures.as_completed(futures, timeout=timeout):
                 try:
                     res = fut.result()
@@ -342,6 +474,12 @@ class SolidityComparator:
         results = [r for r in results if r.get("candidate") is not None and "error" not in r]
         # sort by least changed lines
         results.sort(key=lambda r: r["total_changed_lines"])
+
+        # apply max_allowed_changes threshold
+        if max_allowed_changes is not None:
+            if not results or results[0]["total_changed_lines"] > max_allowed_changes:
+                return []
+
         return results[:top]
 
     def cleanup(self):
@@ -377,13 +515,13 @@ if __name__ == "__main__":
     load_time = time() - start_time
     print(f"Loaded {len(sc._candidates)} candidates in {load_time:.2f} seconds.")
     start_time = time()
-    res = sc.compare_with_base(args.base, top=args.top, workers=args.workers, include_diff=args.diff)
+    res = sc.compare_with_base(args.base, top=args.top, workers=args.workers, include_diff=args.diff, max_allowed_changes=10)
     comp_time = time() - start_time
     print(f"Compared with base in {comp_time:.2f} seconds.")
     pprint.pprint(res)
 
     start_time = time()
-    res = sc.compare_with_base("2196.sol", top=args.top, workers=args.workers, include_diff=args.diff)
+    res = sc.compare_with_base("code.sol", top=args.top, workers=args.workers, include_diff=args.diff, max_allowed_changes=100)
     comp_time = time() - start_time
     print(f"Compared with base in {comp_time:.2f} seconds.")
     pprint.pprint(res)
