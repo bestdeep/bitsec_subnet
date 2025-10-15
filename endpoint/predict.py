@@ -274,7 +274,6 @@ def get_vulnerability_level(score: float) -> str:
         return "10_informational"
     
 def analyze_code(code: str, compare_result: Dict) -> Union[PredictionResponse, str]:
-    return analyze_code_chutes(code, compare_result=compare_result)  
     search_result = aggregate_keyword_matches(code, ["vulnerability", "selfdestruct", "vulnerable", "weak access", "governance attack", "frontrunning", "oracle price", "uninitialized proxy", "incorrect calculation", "rounding error", "input validation", "bad randomness", "replay attack", "signature malleability"])
 
     if search_result["matches"]:
@@ -292,8 +291,10 @@ def analyze_code(code: str, compare_result: Dict) -> Union[PredictionResponse, s
 
     scores = score_match_result(search_result)
 
+    max_score = max(scores.values()) if scores else 0.0
+    max_vuln = max(scores, key=scores.get) if scores else None
     console.print(f"Search result: {search_result}")
-    console.print(f"Scores: {scores}")
+    console.print(f"Max vulnerability score: {max_score:.2f} for {max_vuln}")
 
     if compare_result is {}:
         compare_result = search_result

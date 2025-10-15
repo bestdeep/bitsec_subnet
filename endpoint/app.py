@@ -171,7 +171,7 @@ class VulnerabilityAPI:
         async def health_check():
             return {"status": "ok"}
 
-    def run(self, host="0.0.0.0", port=8001):
+    def run(self, host="0.0.0.0", port=8000):
         uvicorn.run(self.app, host=host, port=port)
 
 
