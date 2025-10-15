@@ -1,0 +1,2 @@
+# Governance Attacks
+Governance attacks can take various forms, including allowing proposals to be executed without quorum, allowing execution of proposals without any voting step, or directly manipulating the votes of other participants. These attacks can compromise the decentralized nature of the protocol and lead to centralization of power, or result in financial benefits for the attackers. Governance attacks are particularly relevant in Decentralized Autonomous Organizations (DAOs), where decision-making authority is distributed among token holders.

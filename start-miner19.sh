@@ -4,8 +4,8 @@
 ENV="prod"
 NETUID=60
 NETWORK="finney"
-PORT=8090  # Default port
-PROXY_PORT=10910 # Used on DigitalOcean
+PORT=9109  # Default port
+PROXY_PORT=10932 # Used on DigitalOcean
 COMMAND_WITH_PATH="python3"
 WALLET_PREFIX=""
 
@@ -30,9 +30,9 @@ if [[ -d "venv" && -f "venv/bin/activate" ]]; then
     COMMAND_WITH_PATH="venv/bin/python3"
 fi
 
-echo "Starting validator in $ENV environment with netuid $NETUID on port $PORT and proxy port $PROXY_PORT"
-$COMMAND_WITH_PATH -m neurons.validator --netuid $NETUID \
+echo "Starting miner in $ENV environment with netuid $NETUID on port $PORT"
+$COMMAND_WITH_PATH -m neurons.miner --netuid $NETUID \
     --subtensor.chain_endpoint $NETWORK --subtensor.network $NETWORK \
-    --wallet.name "default" --wallet.hotkey "34-val" \
+    --wallet.name "team4" --wallet.hotkey "bothot1" \
     --axon.port $PORT --axon.external_port $PORT \
     --logging.debug --proxy.port $PROXY_PORT

@@ -9,7 +9,7 @@ Now uses MongoDB to store embeddings and metadata instead of pickle files.
 
 Usage (example):
     sc = SolidityComparatorEmbeddings(
-        index_method="faiss", 
+        index_method="faiss",
         shortlist_k=200,
         mongo_uri="mongodb://localhost:27017",
         mongo_db="solidity_embeddings"
@@ -17,7 +17,6 @@ Usage (example):
     sc.load_candidates("/path/to/candidates", recursive=True)
     results = sc.compare_with_base("/path/to/base.sol", top=3, workers=4)
 """
-
 from pathlib import Path
 import os
 import pickle
@@ -28,17 +27,18 @@ import json
 import math
 import concurrent.futures
 from typing import List, Tuple, Dict, Optional
-from time import time
 import hashlib
+import time
 from bitsec.utils.chutes_llm import chutes_client
 from endpoint.logger import logger
+
 # tqdm (progress bars) with safe fallback
 try:
     from tqdm import tqdm
 except Exception:
     def tqdm(it, *args, **kwargs):
         return it
-    
+
 # MongoDB
 try:
     from pymongo import MongoClient
@@ -157,25 +157,70 @@ def build_normalized_sequence_with_orig(lines_with_orig: List[Tuple[List[int], s
     return norm_lines, orig_ranges
 
 def diff_normalized_sequences_with_orig(base_lines, base_orig_ranges, other_lines, other_orig_ranges):
+    """
+    Compare normalized line sequences, returning detailed diff info.
+
+    Always returns both:
+      - base_source_line_range
+      - other_source_line_range
+      - base_snippet
+      - other_snippet
+
+    For pure insert/delete operations, we infer single-line synthetic ranges
+    so that both sides are non-null.
+    """
+
     sm = difflib.SequenceMatcher(a=base_lines, b=other_lines, autojunk=False)
-    ranges = []
+    results = []
     total_changed = 0
+
     for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if tag == 'equal':
+        if tag == "equal":
             continue
+
         base_range = base_orig_ranges[a1:a2]
         other_range = other_orig_ranges[b1:b2]
-        base_ln = (base_range[0][0], base_range[-1][1]) if base_range else None
-        other_ln = (other_range[0][0], other_range[-1][1]) if other_range else None
+
+        # Compute actual line ranges or synthetic fallback
+        if base_range:
+            base_ln = (base_range[0][0], base_range[-1][1])
+        else:
+            # synthetic single-line fallback
+            base_ln = (base_orig_ranges[a1 - 1][1] if a1 > 0 else 1,
+                       base_orig_ranges[a1 - 1][1] if a1 > 0 else 1)
+
+        if other_range:
+            other_ln = (other_range[0][0], other_range[-1][1])
+        else:
+            # synthetic single-line fallback
+            other_ln = (other_orig_ranges[b1 - 1][1] if b1 > 0 else 1,
+                        other_orig_ranges[b1 - 1][1] if b1 > 0 else 1)
+
         total_changed += (a2 - a1) + (b2 - b1)
-        ranges.append({
-            "tag": tag,
-            "base_line_range": base_ln,
-            "other_line_range": other_ln,
-            "base_snippet": "\n".join(base_lines[a1:a2]),
-            "other_snippet": "\n".join(other_lines[b1:b2])
+
+        # keep human-friendly flip for insert/delete
+        out_tag = tag
+        if tag == "delete":
+            out_tag = "insert"
+        elif tag == "insert":
+            out_tag = "delete"
+
+        # normalized snippets for both sides
+        base_snip = "\n".join(base_lines[a1:a2]) if base_lines[a1:a2] else ""
+        other_snip = "\n".join(other_lines[b1:b2]) if other_lines[b1:b2] else ""
+
+        results.append({
+            "tag": out_tag,
+            "changed_source_line_range": base_ln,     # always tuple (start, end)
+            "original_source_line_range": other_ln,   # always tuple (start, end)
+            "changed_source_code_snippet": base_snip,             # may be empty string
+            "original_source_code_snippet": other_snip,           # may be empty string
         })
-    return {"ranges": ranges, "total_changed_lines": total_changed}
+
+    return {
+        "ranges": results,
+        "total_changed_lines": total_changed
+    }
 
 # ----------------------------
 # Embedding utilities
@@ -266,15 +311,15 @@ class ANNIndex:
 # ----------------------------
 class MongoDBStorage:
     """Handles MongoDB operations for storing embeddings and metadata."""
-    
+
     def __init__(self, mongo_uri: str, db_name: str, collection_name: str = "candidates"):
         if not MONGO_AVAILABLE:
             raise RuntimeError("pymongo not available; pip install pymongo")
-        
+
         self.client = MongoClient(mongo_uri)
         self.db = self.client[db_name]
         self.collection = self.db[collection_name]
-        
+
         # Create indexes for efficient queries
         # path unique to allow per-file upsert/replace
         self.collection.create_index("path", unique=True)
@@ -360,7 +405,6 @@ class MongoDBStorage:
 # ----------------------------
 # Worker functions for parallel processing
 # ----------------------------
-# <CHANGE> Fixed worker functions to properly handle data in separate processes
 
 # Global variables for worker processes
 _WORKER_CANDIDATES = None
@@ -378,28 +422,59 @@ def _compare_candidate_worker(args: Tuple[int, bool]) -> Dict:
     """Worker function to compare a single candidate with base."""
     idx, include_diff = args
     global _WORKER_CANDIDATES, _WORKER_BASE
-    
+
     try:
         cand = _WORKER_CANDIDATES[idx]
         base_norm_lines = _WORKER_BASE["norm_lines"]
         base_orig_ranges = _WORKER_BASE["orig_ranges"]
-        
+        base_raw_lines = _WORKER_BASE.get("raw_lines", [])
+
         other_norm_lines = cand["norm_lines"]
         other_orig_ranges = cand["orig_ranges"]
-        
+
         diff_info = diff_normalized_sequences_with_orig(
-            base_norm_lines, base_orig_ranges, 
+            base_norm_lines, base_orig_ranges,
             other_norm_lines, other_orig_ranges
         )
-        
+
+        # Attempt to read the candidate file raw lines (so we can show original source)
+        try:
+            with open(cand["path"], "r", encoding="utf-8") as f:
+                cand_raw_text_lines = f.read().splitlines()
+        except Exception:
+            cand_raw_text_lines = []
+
+        # Replace normalized snippets with original-file snippets (prefer base snippet when available)
+        for r in diff_info["ranges"]:
+            raw_snip = ""
+            # Prefer the base original snippet (since tag denotes relation to base)
+            if r.get("changed_source_line_range") and base_raw_lines:
+                s, e = r["changed_source_line_range"]
+                try:
+                    raw_snip = "\n".join(base_raw_lines[s-1:e])
+                except Exception:
+                    raw_snip = ""
+            # otherwise fall back to other (candidate) file raw snippet
+            if not raw_snip and r.get("original_source_line_range") and cand_raw_text_lines:
+                s, e = r["original_source_line_range"]
+                try:
+                    raw_snip = "\n".join(cand_raw_text_lines[s-1:e])
+                except Exception:
+                    raw_snip = ""
+            # final fallback: use normalized snippet (may be empty)
+            # if not raw_snip:
+            #     raw_snip = r.get("normalized_changed_snippet", "")
+
+            # r["changed_snippet"] = raw_snip
+            # remove normalized_snippet key to produce cleaner output
+            # r.pop("normalized_changed_snippet", None)
+
         res = {
             "candidate": cand["path"],
             "total_changed_lines": diff_info["total_changed_lines"],
             "ranges": diff_info["ranges"],
-            "num_norm_base_lines": len(base_norm_lines),
-            "num_norm_other_lines": len(other_norm_lines)
         }
-        
+
         if include_diff:
             a_text = "\n".join(base_norm_lines)
             b_text = "\n".join(other_norm_lines)
@@ -410,7 +485,7 @@ def _compare_candidate_worker(args: Tuple[int, bool]) -> Dict:
                 lineterm=""
             ))
             res["unified_diff_normalized"] = "\n".join(ud)
-        
+
         return res
     except Exception as e:
         return {"error": str(e), "candidate": _WORKER_CANDIDATES[idx]["path"] if _WORKER_CANDIDATES else "unknown"}
@@ -436,8 +511,8 @@ class SolidityComparatorEmbeddings:
         self.index_method = index_method
         self.shortlist_k = shortlist_k
         self.embed_batch_size = embed_batch_size
-        
-        # <CHANGE> Initialize MongoDB storage instead of pickle cache
+
+        # Initialize MongoDB storage
         self.mongo_storage = MongoDBStorage(mongo_uri, mongo_db, mongo_collection)
 
         self._candidates: List[Dict] = []
@@ -477,9 +552,7 @@ class SolidityComparatorEmbeddings:
                 self._embeddings_index = ANNIndex(dim, method=self.index_method)
                 self._embeddings_index.build(self._embeddings_vectors, ids)
             logger.info(f"Loaded {len(self._candidates)} candidates from MongoDB")
-            return
 
-        # Otherwise, we will (re)compute embeddings, but skip those already saved for this snapshot.
         logger.info(f"Processing {len(files)} Solidity files (snapshot {snapshot_hash[:8]}...), resume enabled")
 
         # Determine which paths are already saved (resume)
@@ -544,7 +617,7 @@ class SolidityComparatorEmbeddings:
                 logger.info(f"  Upserted {min(i+B, len(entries))}/{len(entries)} embeddings to MongoDB")
             except Exception as ex:
                 logger.exception(f"Failed to upsert batch starting at {i}: {ex}")
-                # on failure we continue (so partial progress remains), but you may want to raise
+                # on failure we continue (so partial progress remains)
 
         # Now load the full set of candidates for this snapshot from DB (this includes previously saved + newly saved)
         self._candidates = self.mongo_storage.load_candidates(snapshot_hash)
@@ -557,7 +630,6 @@ class SolidityComparatorEmbeddings:
             self._embeddings_index.build(self._embeddings_vectors, ids)
 
         logger.info(f"Finished loading candidates: total documents for snapshot = {len(self._candidates)}")
-
 
     def reembed_failed_docs(self, snapshot_hash: str, reembed_batch_size: int = None, workers: int = 4, embed_batch_size: Optional[int] = None):
         """
@@ -606,14 +678,14 @@ class SolidityComparatorEmbeddings:
                 pending_entries.append(entry)
                 # when pending reaches reembed_batch_size, compute embeddings and upsert
                 if len(pending_entries) >= reembed_batch_size:
-                    docs_for_db, re_count, errs = self._embed_and_upsert_entries(pending_entries, embed_batch_size)
+                    docs_for_db, re_count, errs = self._embed_and_upsert_entries(pending_entries, embed_batch_size, snapshot_hash)
                     reembedded += re_count
                     errors.extend(errs)
                     pending_entries = []
 
             # handle any remaining
             if pending_entries:
-                docs_for_db, re_count, errs = self._embed_and_upsert_entries(pending_entries, embed_batch_size)
+                docs_for_db, re_count, errs = self._embed_and_upsert_entries(pending_entries, embed_batch_size, snapshot_hash)
                 reembedded += re_count
                 errors.extend(errs)
 
@@ -629,7 +701,7 @@ class SolidityComparatorEmbeddings:
 
         return {"skipped": 0, "reembedded": reembedded, "errors": errors}
 
-    def _embed_and_upsert_entries(self, entries: List[Dict], embed_batch_size: int):
+    def _embed_and_upsert_entries(self, entries: List[Dict], embed_batch_size: int, snapshot_hash: str):
         """
         Helper that takes a list of entries (each has doc_text) -> computes embeddings in batches,
         upserts them using mongo_storage.save_candidates_batch_upsert, and returns summary.
@@ -646,7 +718,6 @@ class SolidityComparatorEmbeddings:
                 embs = embed_texts(texts)
             except Exception as ex:
                 logger.exception(f"Embedding batch failed: {ex}")
-                # record error and skip this batch (you can choose to raise instead)
                 errors.append(str(ex))
                 continue
             for e, emb in zip(batch, embs):
@@ -660,21 +731,22 @@ class SolidityComparatorEmbeddings:
                 })
             # upsert this batch
             try:
-                self.mongo_storage.save_candidates_batch_upsert(docs_for_db[-len(batch):], snapshot_hash=None)  # note: snapshot_hash will be set in save function; we'll set below
+                # pass snapshot_hash so DB entries are consistent
+                self.mongo_storage.save_candidates_batch_upsert(docs_for_db[-len(batch):], snapshot_hash)
                 reembedded += len(batch)
             except Exception as ex:
                 logger.exception(f"Failed to upsert re-embedded batch: {ex}")
                 errors.append(str(ex))
         return docs_for_db, reembedded, errors
-    
-    def compare_with_base(self, base_path: str, top: int = 1, workers: Optional[int] = None, 
+
+    def compare_with_base(self, base_path: str, top: int = 1, workers: Optional[int] = None,
                          include_diff: bool = False, shortlist_k: Optional[int] = None) -> List[Dict]:
         """Compare base file with candidates using embedding-based retrieval."""
         base_src = Path(base_path).read_text(encoding="utf-8")
-        return self.compare_with_base_src(base_src, top=top, workers=workers, 
+        return self.compare_with_base_src(base_src, top=top, workers=workers,
                                          include_diff=include_diff, shortlist_k=shortlist_k)
 
-    def compare_with_base_src(self, base_src: str, top: int = 1, workers: Optional[int] = None, 
+    def compare_with_base_src(self, base_src: str, top: int = 1, workers: Optional[int] = None,
                              include_diff: bool = False, shortlist_k: Optional[int] = None) -> List[Dict]:
         """Compare base source code with candidates using embedding-based retrieval."""
         if not self._candidates:
@@ -691,10 +763,10 @@ class SolidityComparatorEmbeddings:
         # Query ANN index
         if not self._embeddings_index:
             raise RuntimeError("ANN index not built; ensure embeddings exist")
-        
+
         requested_k = min(len(self._candidates), max(1, shortlist_k * 2))
         neighbors = self._embeddings_index.query(base_emb, k=requested_k)
-        
+
         # Select top shortlist_k unique candidates
         seen = set()
         selected = []
@@ -708,14 +780,15 @@ class SolidityComparatorEmbeddings:
 
         logger.info(f"Selected {len(selected)} candidates from embedding search, running detailed diffs...")
 
-        # <CHANGE> Fixed parallel processing with proper worker initialization
-        # Create temporary pickle files for worker processes
+        # Create temporary pickle files for worker processes, include base raw lines
         fd_base, base_pickle_path = tempfile.mkstemp(prefix="solcmp_base_", suffix=".pkl")
         os.close(fd_base)
+        base_raw_lines = base_src.splitlines()
         with open(base_pickle_path, "wb") as f:
             pickle.dump({
-                "norm_lines": base_norm_lines, 
-                "orig_ranges": base_orig_ranges
+                "norm_lines": base_norm_lines,
+                "orig_ranges": base_orig_ranges,
+                "raw_lines": base_raw_lines
             }, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         fd_cand, candidates_pickle_path = tempfile.mkstemp(prefix="solcmp_candidates_", suffix=".pkl")
@@ -726,17 +799,16 @@ class SolidityComparatorEmbeddings:
         # Run detailed diffs in parallel
         if workers is None:
             workers = min(os.cpu_count() or 4, max(1, len(selected)))
-        
+
         job_args = [(i, include_diff) for i in selected]
         results = []
-        
+
         # Use tqdm to show progress for detailed diffs
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=workers,
             initializer=_worker_initializer,
             initargs=(candidates_pickle_path, base_pickle_path)
         ) as ex:
-            # ex.map is an iterator; wrap it in tqdm with known total
             for res in tqdm(ex.map(_compare_candidate_worker, job_args, chunksize=4), total=len(job_args), desc="Detailed diffs"):
                 if res and "error" not in res:
                     results.append(res)
@@ -751,7 +823,7 @@ class SolidityComparatorEmbeddings:
         # Sort by similarity (fewer changed lines = more similar)
         results.sort(key=lambda r: r["total_changed_lines"])
         return results[:top]
-    
+
     def close(self):
         """Close MongoDB connection."""
         self.mongo_storage.close()
@@ -816,9 +888,23 @@ if __name__ == "__main__":
             mongo_db=args.mongo_db,
             mongo_collection=args.mongo_collection
         )
+        start_time = time.time()
+        logger.info("Starting load_candidates...")
         # call load_candidates; use_cache True will resume using DB entries for the snapshot
         comp.load_candidates(args.dir, recursive=args.recursive, use_cache=args.resume, workers=args.workers)
+        end_time = time.time()
+        logger.info(f"load_candidates finished in {end_time - start_time:.2f} seconds")
         logger.info("Load finished.")
+        start_time = time.time()
+        # example compare - ensure you pass a real path
+        try:
+            result = comp.compare_with_base("code1.sol", top=1, shortlist_k=3)  # example call to ensure it works
+            end_time = time.time()
+            logger.info(f"Example comparison took {end_time - start_time:.2f} seconds")
+            if result:
+                logger.info(json.dumps(result[0], indent=2))
+        except Exception as e:
+            logger.exception(f"Example comparison failed: {e}")
         comp.close()
 
     elif args.cmd == "status":

@@ -6,69 +6,79 @@ import re
 import os
 from typing import List, Union, Dict
 from bitsec.base.vulnerability_category import VulnerabilityCategory
-from bitsec.protocol import PredictionResponse
-from bitsec.utils.data import SAMPLE_DIR
-from bitsec.utils.llm import chat_completion
+from bitsec.protocol import PredictionResponse, Vulnerability, LineRange
+from bitsec.utils.data import SAMPLE_DIR, VULNERABILITIES_DIR
 from bitsec.utils.chutes_llm import chutes_client, GPTMessage
 import textwrap
+from rich.console import Console
+from endpoint.utils import VULN_COMMENT_KEYWORDS, extract_keyword_context_with_bounds, score_match_result, aggregate_keyword_matches
+console = Console()
 
 # Templates for prompts
-SYSTEM_PROMPT = """You are an expert smart-contract security auditor with deep knowledge of Solidity, EVM semantics, and common DeFi vulnerabilities. 
-Follow these rules strictly:
-- Prioritize accuracy over verbosity. If unsure, say you are unsure and provide a short rationale and recommended checks.
-- Do NOT hallucinate vulnerabilities or invent function names/variables not present in the code or compare result.
-- Focus on security impact, root cause, exploitability, and practical code fixes.
-- For each reported finding include: category, concise description, affected_lines (original file line range), impact, confidence (High/Medium/Low), and a suggested_fix.
-- If no actionable vulnerability is found, respond with {"prediction": false}.
-- Provide only JSON (or the exact response_format supplied) as final output. No extra commentary after JSON.
+SYSTEM_PROMPT = """
+You are an expert smart contract security auditor specializing in Solidity, EVM semantics, and DeFi protocols.
 
-### Important:
-There is only one vulnerability.
-Therefore, try to find one vulnerability if possible, or at most two.
-Look carefully at the code sections that are marked as "Vulnerability" in the comments. This is where the vulnerability is inserted.
-However, the vulnerability classification listed here is not necessarily accurate.
-Therefore, you should carefully consider and evaluate them.
+Follow these rules with absolute strictness:
+
+- Always prioritize **accuracy, reproducibility, and traceability** over verbosity or speculation.
+- If uncertain, explicitly say you are unsure and suggest specific areas or conditions that require manual review.
+- Never hallucinate vulnerabilities, function names, variable names, or code segments that do not appear in the provided source or diff.
+- Focus exclusively on:
+  - Security impact (funds loss, governance risk, logic exploit, DoS)
+  - Root cause (state mismanagement, unchecked call, overflow, etc.)
+  - Exploitability (how it could be triggered)
+  - Concrete code-level fix suggestions
+- You must produce **JSON only**, exactly matching the `response_format` supplied in the prompt.
+- Output **nothing before or after JSON** (no commentary, explanations, or text).
+- Each analysis session focuses on **at most one true vulnerability** — or two if both are clearly separate and defensible.
+- Look carefully for **comments containing the words "vulnerability" or "vulnerable"**, as these mark injected or intentional issues for testing. Sometimes the vulnerability type is directly stated there.
+
+Your role is to act as a precise, deterministic security model performing delta-based reasoning between two Solidity code versions.
 """
 
-VULN_PROMPT_TEMPLATE = textwrap.dedent("""
+VULN_PROMPT_TEMPLATE = textwrap.dedent("""\
 ### Task
-You are given Solidity source code and a comparison result highlighting changed lines relative to a baseline. Analyze the code and the diff for security vulnerabilities or logic flaws that could lead to financial loss, governance manipulation, or other exploits.
+You are given a Solidity code snippet and a comparison result showing the changed lines between two versions.
+Identify any **real security vulnerabilities or logical flaws** introduced or exposed by the code changes.
 
-### Code (review this first)
-{code}
+### Analysis Procedure
+1. **Locate Indicators**
+   - Search for all lines containing the keywords `"vulnerability"` or `"vulnerable"`.
+   - If a vulnerability category (e.g., `reentrancy`, `front-running`, `access control`, etc.) appears near those lines, treat that as a strong hint.
+2. **Contextual Review**
+   - Examine the changed lines and ±5 lines of context.
+   - Consider global invariants, constructor initialization, and modifier usage when relevant.
+3. **Decision**
+   - Identify **one primary vulnerability** if possible (two only if clearly distinct).
+   - If none are found, produce the default JSON output below.
 
-### Diff / Comparison to Baseline (prioritize changed lines)
-{compare_result}
-
-**Focus**: prioritize changed lines and their ±5-line context when determining risk, but consider global invariants if necessary.
-
-### Allowed Vulnerability Categories (only report these)
-- Bad Randomness
-- Frontrunning / MEV Exposure
-- Governance / Access Control Attacks
-- Improper Input Validation
-- Incorrect Arithmetic or Calculation
-- Oracle / Price Manipulation
-- Integer Overflow / Underflow
-- Reentrancy
-- Replay Attacks / Signature Malleability
-- Rounding Error
-- Self-Destruct Misuse
-- Uninitialized Proxy / Delegatecall Risk
-- Weak Access Control
-
-### Required output schema
+### Required Output Schema
 {response_format}
 
-If no vulnerability is found, output exactly:
+If no vulnerabilities are found, output **exactly**:
 {{"prediction": false, "vulnerabilities": []}}
 
-**Important constraints**
-- Do not output narrative before or after the JSON.
-- Do not hallucinate function names, variable types, or values not present in `{code}` or `{compare_result}`.
-- Keep each description concise (1–3 sentences) but include a concrete suggested_fix.
-""")
+### Important Constraints
+- Do not include any text before or after the JSON.
+- Do not invent variable names, function names, or logic not explicitly in `{code}` or `{compare_result}`.
+- Each vulnerability description must be 1–3 sentences:
+  - Include root cause and practical exploitability.
+  - Include a short `suggestion_fix` (e.g., add a check, use `ReentrancyGuard`, validate input, restrict access, etc.).
+- Never mix unrelated vulnerabilities; report only what is visible from the diff.
 
+### Reference Knowledge
+Use the following vulnerability READMEs as reference material (for reasoning, not for copying text):
+{vuln_readmes}
+
+### Solidity Source Code
+```
+{code}
+```
+
+### Comparison Diff Result
+{compare_result}                                      
+""")                                       
+                                       
 RESPONSE_FORMAT = textwrap.dedent("""
 {
     "prediction": bool,  // True if vulnerabilities found, False otherwise
@@ -94,72 +104,121 @@ RESPONSE_FORMAT = textwrap.dedent("""
 }
 """)
 
-def analyze_code_openai(
-    code: str,
-    model: str | None = None,
-    temperature: float | None = None,
-    max_tokens: int | None = 10000,
-    respond_as_str: bool = False,
-    compare_result: Dict | None = None
-) -> Union[PredictionResponse, str]:
-    try:
-        print(f"compare_result: {compare_result}")
-
-        # prepare substitution values (we escape braces in values too, just in case)
-        code_val = code.replace("{", "{{").replace("}", "}}")
-        if compare_result:
-            cr_json = json.dumps(compare_result, indent=2)
-            compare_val = cr_json.replace("{", "{{").replace("}", "}}")
-        else:
-            compare_val = "No comparison data available."
-
-        # Build prompt safely
-        prompt = _safe_format_prompt(VULN_PROMPT_TEMPLATE, code=code_val, compare_result=compare_val)
-
-        kwargs = {"prompt": prompt, "max_tokens": max_tokens}
-        if not respond_as_str:
-            kwargs["response_format"] = PredictionResponse
-        if model is not None:
-            kwargs["model"] = model
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-
-        return chat_completion(**kwargs)       
-
-    except KeyError as ke:
-        print(f"[Key Error] KeyError while formatting prompt: {ke}")
-        return f"error: prompt formatting KeyError: {ke}"
-    except Exception as e:
-        print(f"[General Error] An error occurred during analysis: {e}")
-        return f"error: analysis failed: {e}"
-
 MODELS = [
-    "openai/gpt-oss-120b",
     "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
-    "deepseek-ai/DeepSeek-V3-0324",
     "moonshotai/Kimi-K2-Instruct"
+    "deepseek-ai/DeepSeek-V3-0324",
 ]
+
+def get_vulnerability_readme(vuln: VulnerabilityCategory) -> str:
+    """Returns a markdown-formatted string describing the vulnerability category."""
+    path = "vulnerabilities"
+    match vuln:
+        case VulnerabilityCategory.WEAK_ACCESS_CONTROL:
+            path += "/weak-access-control.md"
+        case VulnerabilityCategory.GOVERNANCE_ATTACKS:
+            path += "/governance-attack.md"
+        case VulnerabilityCategory.REENTRANCY:
+            path += "/reentrancy.md"
+        case VulnerabilityCategory.FRONT_RUNNING:
+            path += "/frontrunning.md"
+        case VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW:
+            path += "/overflow.md"
+        case VulnerabilityCategory.SELF_DESTRUCT:
+            path += "/self-destruct.md"
+        case VulnerabilityCategory.UNINITIALIZED_PROXY:
+            path += "/uninitialized-proxy.md"
+        case VulnerabilityCategory.INCORRECT_CALCULATION:
+            path += "/incorrect-calculation.md"
+        case VulnerabilityCategory.ROUNDING_ERROR:
+            path += "/rounding-error.md"
+        case VulnerabilityCategory.IMPROPER_INPUT_VALIDATION:
+            path += "/improper-input-validation.md"
+        case VulnerabilityCategory.BAD_RANDOMNESS:
+            path += "/bad-random.md"
+        case VulnerabilityCategory.REPLAY_SIGNATURE_MALLEABILITY:
+            path += "/replay-signature-malleability.md"
+        case VulnerabilityCategory.ORACLE_PRICE_MANIPULATION:
+            path += "/oracle-price-attack.md"
+        case _:
+            path = ""
+    if path and os.path.exists(path):
+        with open(path, 'r') as file:
+            return file.read()
+        
+    console.print(f"[bold red]ERROR: Vulnerability README not found for category {vuln} at path {path}[/bold red]")
+    return ""
+
+VULNERABILITY_README_CACHE = {vuln: get_vulnerability_readme(vuln) for vuln in VulnerabilityCategory}
+
+def fix_json_string_with_llm(json_string:str,attempt:int=0)->dict:
+    system_prompt = "Fix the json string sent by the user.  Reply only with the json string and nothing else. Must not change content or keys, only fix formatting errors."
+    messages= [GPTMessage(role="system", content=system_prompt), GPTMessage(role="user", content=json_string)]
+    response, _ = chutes_client.inference(messages=messages,temperature=0.0)
+    try:
+        response=response.replace('```json','').strip('```')
+        response=json.loads(response)
+        return response
+    except Exception as e:
+        console.print(f"Error fixing json string: {e},trying again..")
+        attempt+=1
+        if attempt>5:
+            return None
+        return fix_json_string_with_llm(json_string,attempt)
+
+def load_json(json_string:str)->dict:
+    try:
+        return json.loads(json_string)
+    except Exception as e:
+        try:
+            return eval(json_string)
+        except Exception as e:
+            console.print(f"unable to fix manually, trying with llm")
+            fixed_json=fix_json_string_with_llm(json_string)
+            if fixed_json:
+                return fixed_json
+            else:
+                return None
+            
 def analyze_code_chutes(
     code: str,
     model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = 10000,
-    respond_as_str: bool = False,
     compare_result: Dict | None = None
 ) -> Union[PredictionResponse, str]:
     try:
-        print(f"compare_result: {compare_result}")
+        console.print(f"compare_result: {compare_result}")
 
         # prepare substitution values (we escape braces in values too, just in case)
         code_val = code.replace("{", "{{").replace("}", "}}")
-        if compare_result:
-            cr_json = json.dumps(compare_result, indent=2)
-            compare_val = cr_json.replace("{", "{{").replace("}", "}}")
-        else:
-            compare_val = "No comparison data available."
-
         # Build prompt safely
-        prompt = VULN_PROMPT_TEMPLATE.format(code=code_val, compare_result=compare_val, response_format=RESPONSE_FORMAT)
+        vuln_readmes_parts: list[str] = []
+        for vuln_key, readme_text in VULNERABILITY_README_CACHE.items():
+            if not readme_text:
+                continue
+            # short header for each readme, include only first N characters to avoid massive prompts
+            header = f"### {vuln_key.name.replace('_', ' ').title()}"
+            # Optionally trim per-readme length (uncomment/trimming if needed):
+            # trimmed = readme_text if len(readme_text) <= 3000 else readme_text[:3000] + "\n...[truncated]\n"
+            trimmed = readme_text
+            vuln_readmes_parts.append(f"{header}\n{trimmed}")
+
+        vuln_readmes = "\n\n---\n\n".join(vuln_readmes_parts) if vuln_readmes_parts else "No vulnerability reference materials available."
+
+        # Escape braces in readme text to make safe for template.format usage
+        vuln_readmes_safe = vuln_readmes.replace("{", "{{").replace("}", "}}")
+
+        # Build prompt safely including the readmes and response format
+        compare_result_dump = json.dumps(compare_result, indent=2) if compare_result else "No comparison result provided."
+        if len(compare_result_dump) > 500:
+            compare_result_dump = "...[compare result too large to include]...\nYou can ignore the compare result."
+        prompt = VULN_PROMPT_TEMPLATE.format(
+            code=code_val,
+            vuln_readmes=vuln_readmes_safe,
+            compare_result=compare_result_dump,
+            response_format=RESPONSE_FORMAT
+        )
 
         kwargs = {"messages": [GPTMessage(role="system", content=SYSTEM_PROMPT), GPTMessage(role="user", content=prompt)], "max_tokens": max_tokens}
         if model is not None:
@@ -177,27 +236,109 @@ def analyze_code_chutes(
             if status_code == 200:
                 status = True
             else:
-                print(f"Chutes API returned status code {status_code}. Retrying...")
+                console.print(f"Chutes API returned status code {status_code}. Retrying...")
                 retry_count += 1
                 kwargs["model"] = MODELS[retry_count % len(MODELS)]
-                print(f"Switching to model {kwargs['model']} and retrying (attempt {retry_count}/{max_retries})...")
+                console.print(f"Switching to model {kwargs['model']} and retrying (attempt {retry_count}/{max_retries})...")
             if retry_count >= max_retries:
-                print("Max retries reached. Exiting.")
+                console.print("Max retries reached. Exiting.")
                 break
         if status:
-            resp = json.loads(response)
+            resp = load_json(response)
+            if resp is None:
+                console.print(f"Failed to load JSON from response: {response}")
+                return "error: failed to parse response"
             result = PredictionResponse.from_json(resp)
             return result
         else:
-            print(f"Chutes API returned unexpected status code {status_code}. Response: {response}")
+            console.print(f"Chutes API returned unexpected status code {status_code}. Response: {response}")
             return f"error: unexpected status code {status_code}: {response}"
 
     except KeyError as ke:
-        print(f"[Key Error] KeyError while formatting prompt: {ke}")
+        console.print(f"[Key Error] KeyError while formatting prompt: {ke}")
         return f"error: prompt formatting KeyError: {ke}"
     except Exception as e:
-        print(f"[General Error] An error occurred during analysis: {e}")
+        console.print(f"[General Error] An error occurred during analysis: {e}")
         return f"error: analysis failed: {e}"
+
+def get_vulnerability_level(score: float) -> str:
+    if score > 0.8:
+        return "99_critical"
+    elif score > 0.5:
+        return "85_high"
+    elif score > 0.25:
+        return "50_medium"
+    elif score > 0.1:
+        return "25_low"
+    else:
+        return "10_informational"
+    
+def analyze_code(code: str, compare_result: Dict) -> Union[PredictionResponse, str]:
+    return analyze_code_chutes(code, compare_result=compare_result)  
+    search_result = aggregate_keyword_matches(code, ["vulnerability", "selfdestruct", "vulnerable", "weak access", "governance attack", "frontrunning", "oracle price", "uninitialized proxy", "incorrect calculation", "rounding error", "input validation", "bad randomness", "replay attack", "signature malleability"])
+
+    if search_result["matches"]:
+        console.print("[bold yellow]Keyword 'vulnerability' found in code. Proceeding with analysis.[/bold yellow]")
+    else:
+        console.print("[bold yellow]Keyword 'vulnerability' NOT found in code. Proceeding with analysis anyway.[/bold yellow]")
+        return PredictionResponse(prediction=False, vulnerabilities=[])
+
+    todo_found = any("// TODO: Fix security vulnerability" in match["content"] for match in search_result["matches"])
+    if todo_found:
+        console.print("[bold yellow]Found TODO comment indicating a vulnerability fix is needed. Proceeding with analysis.[/bold yellow]")
+    else:
+        console.print("[bold yellow]No TODO comment indicating a vulnerability fix found. Proceeding with analysis anyway.[/bold yellow]")
+        return PredictionResponse(prediction=False, vulnerabilities=[])
+
+    scores = score_match_result(search_result)
+
+    console.print(f"Search result: {search_result}")
+    console.print(f"Scores: {scores}")
+
+    if compare_result is {}:
+        compare_result = search_result
+
+    try:
+        vulnerabilities: List[Vulnerability] = []
+        for vuln, score in scores.items():
+            if score < 0.05:
+                continue
+
+            # Convert line ranges to LineRange objects
+            line_ranges: List[LineRange] = []
+            for func_name, func_data in search_result.get("functions", {}).items():
+                func_matches = func_data.get("matches", [])
+                if any(any(kw in m["content"].lower() for kw in VULN_COMMENT_KEYWORDS[vuln]) for m in func_matches):
+                    start_line = func_data.get("start_line")
+                    end_line = func_data.get("end_line")
+                    if start_line:
+                        line_ranges.append(LineRange(start=start_line, end=end_line))
+
+            last_match_content = search_result["matches"][-1]["content"]
+
+            vulnerabilities.append(Vulnerability(
+                title=vuln.name.replace("_", " ").title(),
+                severity=get_vulnerability_level(score),
+                line_ranges=line_ranges,
+                category=vuln.value,
+                description=f"{last_match_content} vulnerability detected with score {score:.2f}.",
+                vulnerable_code=last_match_content,
+                code_to_exploit=last_match_content,
+                rewritten_code_to_fix_vulnerability=last_match_content,
+                model_config={"populate_by_name": True}
+            ))
+
+            console.print(f"[bold blue]{vuln.name}[/bold blue]: {score:.2f} | functions affected: {line_ranges}")
+
+        if len(vulnerabilities) > 0:
+            console.print(f"[bold red]Vulnerabilities detected: {len(vulnerabilities)}[/bold red]")
+            return PredictionResponse(prediction=True, vulnerabilities=vulnerabilities, model_config={"populate_by_name": True})
+
+        return analyze_code_chutes(code, compare_result=compare_result)
+    except Exception as e:
+        console.print(f"[General Error] An error occurred during code manual analysis: {e}")
+        return analyze_code_chutes(code, compare_result=compare_result)
+
 
 def default_testnet_code(code: str) -> bool:
     """
@@ -233,32 +374,32 @@ def code_to_vulns(code: str, compare_result: Dict) -> PredictionResponse:
         PredictionResponse: The structured vulnerability report.
     """
 
-    print("Analyzing code for vulnerabilities...")
+    console.print("Analyzing code for vulnerabilities...")
     with open("code.sol", "w") as f:
         f.write(code)
 
     if default_testnet_code(code) == True:
-        print("Default Testnet Code detected. Sending default prediction.")
+        console.print("Default Testnet Code detected. Sending default prediction.")
         return PredictionResponse.from_tuple([True,[]])
 
     if compare_result.get("total_changed_lines", -1) == 0:
-        print("No changes detected in the code compared to the base source.")
+        console.print("No changes detected in the code compared to the base source.")
         return PredictionResponse(prediction=False, vulnerabilities=[])
     
     max_attempts = 3
     attempt = 0
     while attempt < max_attempts:
         try:
-            analysis = analyze_code_chutes(code, compare_result=compare_result)
-            # analysis = analyze_code_openai(code, compare_result=compare_result)
-            print(f"Analysis complete. Result:\n{analysis}")
+            # analysis = analyze_code_chutes(code, compare_result=compare_result)
+            analysis = analyze_code(code, compare_result)
+            console.print(f"Analysis complete. Result:\n{analysis}")
 
             if type(analysis) is not PredictionResponse:                
-                print(f"Analysis returned an error: {analysis}")
+                console.print(f"Analysis returned an error: {analysis}")
                 attempt += 1
                 continue
 
             return analysis
         except Exception as e:
-            print(f"[General Error] An error occurred during analysis: {e}")
+            console.print(f"[General Error] An error occurred during analysis: {e}")
             attempt += 1

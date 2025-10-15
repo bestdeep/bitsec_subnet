@@ -126,7 +126,7 @@ class ChutesProvider:
 
         model = model or DEFAULT_MODEL
         if not self.supports_model(model):
-            model = "openai/gpt-oss-120b"
+            model = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
 
         # Convert messages to dict format
         messages_dict = []

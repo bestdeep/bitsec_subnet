@@ -1,0 +1,2 @@
+# Rounding Error
+Rounding errors occur when smart contracts perform calculations involving floating-point arithmetic and fail to account for precision or rounding. These errors can lead to financial discrepancies, loss of funds, or incorrect rewards calculated within the contract. Smart contracts should use fixed-point arithmetic or alternative mechanisms to handle decimal calculations accurately, ensuring that rounding errors are minimized or eliminated.

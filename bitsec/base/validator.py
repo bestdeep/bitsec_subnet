@@ -173,7 +173,8 @@ class BaseValidatorNeuron(BaseNeuron):
                 self.sync()
 
                 self.step += 1
-                time.sleep(600) # run every 600s
+                # time.sleep(600) # run every 600s
+                time.sleep(90)  # run every 90s
 
         # If someone intentionally stops the validator, it'll safely terminate operations.
         except KeyboardInterrupt:

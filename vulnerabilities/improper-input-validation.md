@@ -1,0 +1,2 @@
+# Improper Input Validation
+Improper input validation occurs when smart contracts fail to adequately validate and sanitize user inputs, leaving them vulnerable to various types of attacks. This type of vulnerability can be exploited to manipulate contract logic, inject malicious data, or cause unexpected behavior. Proper input validation ensures that only valid and expected data is processed by the contract, reducing the risk of exploitation.

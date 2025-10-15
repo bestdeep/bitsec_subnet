@@ -1,0 +1,2 @@
+# Reentrancy
+Reentrancy vulnerabilities occur when a contract allows external calls to be made to it during its execution without properly managing the state changes and flow of execution. Reentrancy allows an attacker to repeatedly call a vulnerable contract before the previous call completes, leading to unexpected state changes and unauthorized fund transfers. Implementing secure state management patterns and applying mutex locks can mitigate the risk of reentrancy attacks.

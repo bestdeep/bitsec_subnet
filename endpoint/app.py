@@ -2,7 +2,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from endpoint.predict import code_to_vulns
-from endpoint.solidity_comparator import SolidityComparatorFastLoadOpt
+from endpoint.solidity_comparator_embeddings import SolidityComparatorEmbeddings
 from time import monotonic
 import asyncio
 import hashlib
@@ -54,7 +54,14 @@ class VulnerabilityAPI:
     def __init__(self, lru_size: int = 1024, lru_ttl: float = 300.0):
         self.app = FastAPI()
         self._setup_routes()
-        self.comparator = SolidityComparatorFastLoadOpt()
+        self.comparator = SolidityComparatorEmbeddings(
+            index_method="faiss",
+            shortlist_k=200,
+            embed_batch_size=32,
+            mongo_uri="mongodb://localhost:27017",
+            mongo_db="solidity_embeddings",
+            mongo_collection="candidates"
+        )
 
         # Cache: completed results
         self._result_cache = _LRUCache(maxsize=lru_size, ttl=lru_ttl)
@@ -64,9 +71,9 @@ class VulnerabilityAPI:
         self._in_progress_lock = asyncio.Lock()
 
         start_time = monotonic()
-        # self.comparator.load_candidates("samples/clean-codebases")
+        self.comparator.load_candidates(directory="samples/clean-codebases", use_cache=True, workers=8)
         end_time = monotonic()
-        print(f"Loaded candidates in {end_time - start_time:.2f} seconds")
+        print(f"Loaded candidates from mongo db within {end_time - start_time:.2f} seconds")
 
     def _setup_routes(self):
         @self.app.post("/predict")
@@ -123,9 +130,9 @@ class VulnerabilityAPI:
                 loop = asyncio.get_running_loop()
                 compare_results = None
                 # If you want to run heavy compare in executor, uncomment:
-                # compare_results = await loop.run_in_executor(
-                #     None, self.comparator.compare_with_base_src, code, 1, None, False, None, 100
-                # )
+                compare_results = await loop.run_in_executor(
+                    None, self.comparator.compare_with_base_src, code, 1, None, False, 3
+                )
                 compare_for_predict = compare_results[0] if compare_results else {}
                 # call code_to_vulns (assumed cheap); if expensive, also move to executor
                 result = await loop.run_in_executor(
@@ -164,7 +171,7 @@ class VulnerabilityAPI:
         async def health_check():
             return {"status": "ok"}
 
-    def run(self, host="0.0.0.0", port=8000):
+    def run(self, host="0.0.0.0", port=8001):
         uvicorn.run(self.app, host=host, port=port)
 
 
