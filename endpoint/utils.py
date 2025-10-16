@@ -68,7 +68,7 @@ VULN_COMMENT_KEYWORDS = {
     VulnerabilityCategory.WEAK_ACCESS_CONTROL: ["owner only", "weak", "access"],
     VulnerabilityCategory.GOVERNANCE_ATTACKS: ["vote", "manipulation", "voting", "governance"],
     VulnerabilityCategory.REENTRANCY: ["reentrancy"],
-    VulnerabilityCategory.FRONT_RUNNING: ["front running", "frontrunning"],
+    VulnerabilityCategory.FRONT_RUNNING: ["front running", "frontrunning", "nonce"],
     VulnerabilityCategory.ARITHMETIC_OVERFLOW_AND_UNDERFLOW: ["overflow", "underflow", "arithmetic error"],
     VulnerabilityCategory.SELF_DESTRUCT: ["selfdestruct", "self destruct", "suicide"],
     VulnerabilityCategory.UNINITIALIZED_PROXY: ["uninitialized proxy", "initialize", "constructor"],
@@ -76,7 +76,7 @@ VULN_COMMENT_KEYWORDS = {
     VulnerabilityCategory.ROUNDING_ERROR: ["rounding error", "precision loss"],
     VulnerabilityCategory.IMPROPER_INPUT_VALIDATION: ["input validation", "improper"],
     VulnerabilityCategory.BAD_RANDOMNESS: ["bad randomness", "predictable random", "pseudo-random", "pseudorandom"],
-    VulnerabilityCategory.REPLAY_SIGNATURE_MALLEABILITY: ["replay", "malleability", "signature replay", "signature", "replay attack"],
+    VulnerabilityCategory.REPLAY_SIGNATURE_MALLEABILITY: ["replay", "malleability", "signature replay", "signature", "replay attack", "nonce"],
     VulnerabilityCategory.ORACLE_PRICE_MANIPULATION: ["manipulation", "price", "oracle",],
 }
 
