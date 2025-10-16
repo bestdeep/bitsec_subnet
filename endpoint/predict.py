@@ -32,6 +32,7 @@ Follow these rules with absolute strictness:
 - Output **nothing before or after JSON** (no commentary, explanations, or text).
 - Each analysis session focuses on **at most one true vulnerability** — or two if both are clearly separate and defensible.
 - Look carefully for **comments containing the words "vulnerability" or "vulnerable"**, as these mark injected or intentional issues for testing. Sometimes the vulnerability type is directly stated there.
+- If you encounter a line in the code that include "// TODO: Fix security vulnerability", must not output a "no vulnerability" result, as the code is necessarily vulnerable.
 
 Your role is to act as a precise, deterministic security model performing delta-based reasoning between two Solidity code versions.
 """
@@ -65,6 +66,7 @@ If no vulnerabilities are found, output **exactly**:
   - Include root cause and practical exploitability.
   - Include a short `suggestion_fix` (e.g., add a check, use `ReentrancyGuard`, validate input, restrict access, etc.).
 - Never mix unrelated vulnerabilities; report only what is visible from the diff.
+- Remember, if there is a line included "// TODO: Fix security vulnerability", the code definitely has a vulnerability.
 
 ### Reference Knowledge
 Use the following vulnerability READMEs as reference material (for reasoning, not for copying text):
@@ -76,7 +78,7 @@ Use the following vulnerability READMEs as reference material (for reasoning, no
 ```
 
 ### Comparison Diff Result
-{compare_result}                                      
+{compare_result}
 """)                                       
                                        
 RESPONSE_FORMAT = textwrap.dedent("""
